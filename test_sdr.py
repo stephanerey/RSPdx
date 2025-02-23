@@ -270,7 +270,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.RFgain_slider.valueChanged.connect(self.apply_settings)
 
         # Zone d'affichage Matplotlib (plots)
-        self.figure, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(10, 8))
+        self.figure, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'hspace': 0.1})
         self.canvas = FigureCanvas(self.figure)
         main_layout.addWidget(self.canvas)
 
