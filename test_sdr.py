@@ -182,7 +182,68 @@ class MainWindow(QtWidgets.QMainWindow):
         RF_layout.addWidget(self.RFgain_value_label)
         control_layout.addLayout(RF_layout)
 
-        # Case à cocher pour l'AGC
+        # Sliders pour vmin et vmax du waterfall
+        vmin_layout = QtWidgets.QHBoxLayout()
+        vmin_label = QtWidgets.QLabel("Waterfall vmin:")
+        self.vmin_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.vmin_slider.setRange(-100, 0)
+        self.vmin_slider.setValue(-40)
+        self.vmin_value_label = QtWidgets.QLabel(str(self.vmin_slider.value()))
+        self.vmin_slider.valueChanged.connect(lambda val: self.vmin_value_label.setText(str(val)))
+        vmin_layout.addWidget(vmin_label)
+        vmin_layout.addWidget(self.vmin_slider)
+        vmin_layout.addWidget(self.vmin_value_label)
+        control_layout.addLayout(vmin_layout)
+
+        vmax_layout = QtWidgets.QHBoxLayout()
+        vmax_label = QtWidgets.QLabel("Waterfall vmax:")
+        self.vmax_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.vmax_slider.setRange(0, 100)
+        self.vmax_slider.setValue(0)
+        self.vmax_value_label = QtWidgets.QLabel(str(self.vmax_slider.value()))
+        self.vmax_slider.valueChanged.connect(lambda val: self.vmax_value_label.setText(str(val)))
+        vmax_layout.addWidget(vmax_label)
+        vmax_layout.addWidget(self.vmax_slider)
+        vmax_layout.addWidget(self.vmax_value_label)
+        control_layout.addLayout(vmax_layout)
+
+        # Sliders pour ymin et ymax du spectrum
+        ymin_layout = QtWidgets.QHBoxLayout()
+        ymin_label = QtWidgets.QLabel("Spectrum ymin:")
+        self.ymin_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.ymin_slider.setRange(-100, 0)
+        self.ymin_slider.setValue(-60)
+        self.ymin_value_label = QtWidgets.QLabel(str(self.ymin_slider.value()))
+        self.ymin_slider.valueChanged.connect(lambda val: self.ymin_value_label.setText(str(val)))
+        ymin_layout.addWidget(ymin_label)
+        ymin_layout.addWidget(self.ymin_slider)
+        ymin_layout.addWidget(self.ymin_value_label)
+        control_layout.addLayout(ymin_layout)
+
+        ymax_layout = QtWidgets.QHBoxLayout()
+        ymax_label = QtWidgets.QLabel("Spectrum ymax:")
+        self.ymax_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.ymax_slider.setRange(0, 100)
+        self.ymax_slider.setValue(40)
+        self.ymax_value_label = QtWidgets.QLabel(str(self.ymax_slider.value()))
+        self.ymax_slider.valueChanged.connect(lambda val: self.ymax_value_label.setText(str(val)))
+        ymax_layout.addWidget(ymax_label)
+        ymax_layout.addWidget(self.ymax_slider)
+        ymax_layout.addWidget(self.ymax_value_label)
+        control_layout.addLayout(ymax_layout)
+
+        # Slider pour la vitesse du waterfall
+        speed_layout = QtWidgets.QHBoxLayout()
+        speed_label = QtWidgets.QLabel("Waterfall Speed:")
+        self.speed_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.speed_slider.setRange(100, 2000)
+        self.speed_slider.setValue(1200)
+        self.speed_value_label = QtWidgets.QLabel(str(self.speed_slider.value()))
+        self.speed_slider.valueChanged.connect(lambda val: self.speed_value_label.setText(str(val)))
+        speed_layout.addWidget(speed_label)
+        speed_layout.addWidget(self.speed_slider)
+        speed_layout.addWidget(self.speed_value_label)
+        control_layout.addLayout(speed_layout)
         self.agc_checkbox = QtWidgets.QCheckBox("Enable AGC")
         self.agc_checkbox.setChecked(False)
         control_layout.addWidget(self.agc_checkbox)
@@ -195,7 +256,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         main_layout.addLayout(control_layout)
 
-        # Connexions pour mettre à jour automatiquement en fonction des modifications sur les widgets
+        # Connexions pour mettre à jour automatiquement en fonction des modifications sur les sliders
+        self.vmin_slider.valueChanged.connect(self.update_waterfall_limits)
+        self.vmax_slider.valueChanged.connect(self.update_waterfall_limits)
+        self.ymin_slider.valueChanged.connect(self.update_spectrum_limits)
+        self.ymax_slider.valueChanged.connect(self.update_spectrum_limits)
+        self.speed_slider.valueChanged.connect(self.update_waterfall_speed)
         self.sample_rate_combo.currentIndexChanged.connect(self.apply_settings)
         self.center_freq_edit.editingFinished.connect(self.apply_settings)
         self.IFgain_slider.valueChanged.connect(self.apply_settings)
@@ -246,7 +312,26 @@ class MainWindow(QtWidgets.QMainWindow):
         # Lancer l'animation qui appellera Receiver.animate périodiquement
         self.ani = animation.FuncAnimation(self.figure, self.receiver.animate, interval=50, cache_frame_data=False, blit=False)
 
-    def apply_settings(self):
+    def update_waterfall_limits(self):
+        vmin = self.vmin_slider.value()
+        vmax = self.vmax_slider.value()
+        self.receiver.waterfall.set_clim(vmin, vmax)
+        self.canvas.draw_idle()
+
+    def update_spectrum_limits(self):
+        ymin = self.ymin_slider.value()
+        ymax = self.ymax_slider.value()
+        self.ax1.set_ylim(ymin, ymax)
+        self.canvas.draw_idle()
+
+    def update_waterfall_speed(self):
+        speed = self.speed_slider.value()
+        self.receiver.waterfall_data = np.zeros((speed, 1024))
+        self.waterfall.set_extent([self.receiver.center_freq - self.receiver.sample_rate / 2,
+                                   self.receiver.center_freq + self.receiver.sample_rate / 2,
+                                   0, speed])
+        self.ax2.set_ylim(0, speed)
+        self.canvas.draw_idle()
         try:
             # Récupérer et convertir les valeurs depuis les widgets
             sample_rate_mhz = float(self.sample_rate_combo.currentText())
