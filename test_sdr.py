@@ -182,6 +182,9 @@ class MainWindow(QtWidgets.QMainWindow):
         RF_layout.addWidget(self.RFgain_value_label)
         control_layout.addLayout(RF_layout)
 
+        # Deuxième ligne de contrôle pour les sliders
+        sliders_layout = QtWidgets.QHBoxLayout()
+
         # Sliders pour vmin et vmax du waterfall
         vmin_layout = QtWidgets.QHBoxLayout()
         vmin_label = QtWidgets.QLabel("Waterfall vmin:")
@@ -190,10 +193,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vmin_slider.setValue(-40)
         self.vmin_value_label = QtWidgets.QLabel(str(self.vmin_slider.value()))
         self.vmin_slider.valueChanged.connect(lambda val: self.vmin_value_label.setText(str(val)))
+        self.vmin_slider.sliderReleased.connect(self.update_waterfall_limits)
         vmin_layout.addWidget(vmin_label)
         vmin_layout.addWidget(self.vmin_slider)
         vmin_layout.addWidget(self.vmin_value_label)
-        control_layout.addLayout(vmin_layout)
+        sliders_layout.addLayout(vmin_layout)
 
         vmax_layout = QtWidgets.QHBoxLayout()
         vmax_label = QtWidgets.QLabel("Waterfall vmax:")
@@ -202,10 +206,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vmax_slider.setValue(0)
         self.vmax_value_label = QtWidgets.QLabel(str(self.vmax_slider.value()))
         self.vmax_slider.valueChanged.connect(lambda val: self.vmax_value_label.setText(str(val)))
+        self.vmax_slider.sliderReleased.connect(self.update_waterfall_limits)
         vmax_layout.addWidget(vmax_label)
         vmax_layout.addWidget(self.vmax_slider)
         vmax_layout.addWidget(self.vmax_value_label)
-        control_layout.addLayout(vmax_layout)
+        sliders_layout.addLayout(vmax_layout)
 
         # Sliders pour ymin et ymax du spectrum
         ymin_layout = QtWidgets.QHBoxLayout()
@@ -218,7 +223,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ymin_layout.addWidget(ymin_label)
         ymin_layout.addWidget(self.ymin_slider)
         ymin_layout.addWidget(self.ymin_value_label)
-        control_layout.addLayout(ymin_layout)
+        sliders_layout.addLayout(ymin_layout)
 
         ymax_layout = QtWidgets.QHBoxLayout()
         ymax_label = QtWidgets.QLabel("Spectrum ymax:")
@@ -230,7 +235,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ymax_layout.addWidget(ymax_label)
         ymax_layout.addWidget(self.ymax_slider)
         ymax_layout.addWidget(self.ymax_value_label)
-        control_layout.addLayout(ymax_layout)
+        sliders_layout.addLayout(ymax_layout)
 
         # Slider pour la vitesse du waterfall
         speed_layout = QtWidgets.QHBoxLayout()
@@ -243,18 +248,10 @@ class MainWindow(QtWidgets.QMainWindow):
         speed_layout.addWidget(speed_label)
         speed_layout.addWidget(self.speed_slider)
         speed_layout.addWidget(self.speed_value_label)
-        control_layout.addLayout(speed_layout)
-        self.agc_checkbox = QtWidgets.QCheckBox("Enable AGC")
-        self.agc_checkbox.setChecked(False)
-        control_layout.addWidget(self.agc_checkbox)
-        self.agc_checkbox.toggled.connect(self.apply_settings)
-
-        # Bouton pour appliquer les réglages (optionnel)
-        self.apply_button = QtWidgets.QPushButton("Apply Settings")
-        self.apply_button.clicked.connect(self.apply_settings)
-        control_layout.addWidget(self.apply_button)
+        sliders_layout.addLayout(speed_layout)
 
         main_layout.addLayout(control_layout)
+        main_layout.addLayout(sliders_layout)
 
         # Connexions pour mettre à jour automatiquement en fonction des modifications sur les sliders
         self.vmin_slider.valueChanged.connect(self.update_waterfall_limits)
