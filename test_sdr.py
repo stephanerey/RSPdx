@@ -332,6 +332,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                    0, speed])
         self.ax2.set_ylim(0, speed)
         self.canvas.draw_idle()
+    def apply_settings(self):
         try:
             # Récupérer et convertir les valeurs depuis les widgets
             sample_rate_mhz = float(self.sample_rate_combo.currentText())
