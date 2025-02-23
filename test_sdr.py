@@ -353,6 +353,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # Mettre à jour les réglages du récepteur SDR
             self.receiver.update_settings(sample_rate, center_freq, IFgain, RFgain, agc)
+            # Réinitialiser les données du waterfall
+            self.receiver.waterfall_data = np.zeros((self.speed_slider.value(), 1024))
+            self.waterfall.set_data(self.receiver.waterfall_data)
+
             # Mise à jour des axes :
             # Pour le waterfall, on met à jour l'extent et les limites de l'axe
             self.waterfall.set_extent([center_freq - sample_rate / 2,
