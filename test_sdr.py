@@ -58,7 +58,19 @@ class Receiver:
 
     def update_plot(self, iq_data):
         try:
-            # Calcul de la FFT et application du décalage
+            # Calcul de la FFT et application du décalage avec averaging
+            averaging_factor = self.averaging_spinbox.value()
+            fft_data = np.fft.fft(iq_data)
+            fft_data = np.fft.fftshift(fft_data)
+            power = 20 * np.log10(np.abs(fft_data) + 1e-6)
+
+            # Appliquer l'averaging
+            if not hasattr(self, 'average_power'):
+                self.average_power = power
+            else:
+                self.average_power = (self.average_power * (averaging_factor - 1) + power) / averaging_factor
+
+            power = self.average_power
             fft_data = np.fft.fft(iq_data)
             fft_data = np.fft.fftshift(fft_data)
             power = 20 * np.log10(np.abs(fft_data) + 1e-6)
@@ -188,7 +200,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.agc_checkbox = QtWidgets.QCheckBox("AGC")
         self.agc_checkbox.setChecked(False)
         control_layout.addWidget(self.agc_checkbox)
-        sliders_layout = QtWidgets.QHBoxLayout()
+        # Averaging : QSpinBox
+        averaging_label = QtWidgets.QLabel("Averaging:")
+        self.averaging_spinbox = QtWidgets.QSpinBox()
+        self.averaging_spinbox.setRange(1, 100)
+        self.averaging_spinbox.setValue(1)
+        control_layout.addWidget(averaging_label)
+        control_layout.addWidget(self.averaging_spinbox)
 
         # Sliders pour vmin et vmax du waterfall
         vmin_layout = QtWidgets.QHBoxLayout()
