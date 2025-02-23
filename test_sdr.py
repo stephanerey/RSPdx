@@ -208,6 +208,9 @@ class MainWindow(QtWidgets.QMainWindow):
         control_layout.addWidget(averaging_label)
         control_layout.addWidget(self.averaging_spinbox)
 
+        # Sliders layout
+        sliders_layout = QtWidgets.QHBoxLayout()
+
         # Sliders pour vmin et vmax du waterfall
         vmin_layout = QtWidgets.QHBoxLayout()
         vmin_label = QtWidgets.QLabel("Waterfall vmin:")
