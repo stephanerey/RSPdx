@@ -184,7 +184,10 @@ class MainWindow(QtWidgets.QMainWindow):
         RF_layout.addWidget(self.RFgain_value_label)
         control_layout.addLayout(RF_layout)
 
-        # Deuxième ligne de contrôle pour les sliders
+        # AGC : checkbox
+        self.agc_checkbox = QtWidgets.QCheckBox("AGC")
+        self.agc_checkbox.setChecked(False)
+        control_layout.addWidget(self.agc_checkbox)
         sliders_layout = QtWidgets.QHBoxLayout()
 
         # Sliders pour vmin et vmax du waterfall
@@ -332,6 +335,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ax2.set_ylim(0, speed)
         self.canvas.draw_idle()
     def apply_settings(self):
+        # Récupérer et convertir les valeurs depuis les widgets
+        sample_rate_mhz = float(self.sample_rate_combo.currentText())
+        sample_rate = sample_rate_mhz * 1e6
+        center_freq = float(self.center_freq_edit.text()) * 1e6
+        IFgain = self.IFgain_slider.value()
+        RFgain = self.RFgain_slider.value()
+        agc = self.agc_checkbox.isChecked()
         try:
             # Récupérer et convertir les valeurs depuis les widgets
             sample_rate_mhz = float(self.sample_rate_combo.currentText())
