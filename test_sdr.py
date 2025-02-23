@@ -76,7 +76,9 @@ class Receiver:
             self.waterfall_data = np.roll(self.waterfall_data, -1, axis=0)
             self.waterfall_data[-1, :] = power
             self.waterfall.set_data(self.waterfall_data)
-            self.waterfall.set_clim(-20, 0)
+            vmin = self.vmin_slider.value()
+            vmax = self.vmax_slider.value()
+            self.waterfall.set_clim(vmin, vmax)
             self.waterfall.autoscale()
 
             return self.line, self.waterfall
