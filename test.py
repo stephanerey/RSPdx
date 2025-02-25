@@ -12,14 +12,14 @@ class SDRReceiver:
         self.sample_rate = 2e6
         self.center_freq = 137.1e6
         self.waterfall_size = 300  # Nombre de lignes du waterfall
-        self.fft_size = 1024  # Taille de la FFT
+        self.fft_size = 2048  # Taille de la FFT
         self.waterfall_data = np.zeros((self.waterfall_size, self.fft_size))
 
         self.rx_stream = self.sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
         self.sdr.activateStream(self.rx_stream)
 
     def read_samples(self):
-        expected_len = 1024
+        expected_len = self.fft_size
         buff = np.zeros(self.fft_size, np.complex64)
         sr = self.sdr.readStream(self.rx_stream, [buff], self.fft_size)
         if sr.ret > 0:
@@ -91,7 +91,7 @@ class SDRGUI(QtWidgets.QWidget):
         self.freq_input.editingFinished.connect(self.update_frequency)
 
         self.sample_rate_input = QtWidgets.QComboBox()
-        for rate in [1, 2, 5, 10]:
+        for rate in [1, 2, 5, 8, 10]:
             self.sample_rate_input.addItem(f"{rate} MHz", rate * 1e6)
         self.sample_rate_input.setCurrentIndex(1)
         self.sample_rate_input.currentIndexChanged.connect(self.update_sample_rate)
@@ -101,10 +101,10 @@ class SDRGUI(QtWidgets.QWidget):
         control_layout.addWidget(QtWidgets.QLabel("Sample Rate (MHz):"))
         control_layout.addWidget(self.sample_rate_input)
 
-        layout.addLayout(control_layout)
+        # layout.addLayout(control_layout)
 
         # Ajout des spinbox pour contrôler les gains IF et RF
-        gain_layout = QtWidgets.QHBoxLayout()
+        # gain_layout = QtWidgets.QHBoxLayout()
 
         self.if_gain_spinbox = QtWidgets.QSpinBox()
         self.if_gain_spinbox.setRange(20, 59)
@@ -118,9 +118,9 @@ class SDRGUI(QtWidgets.QWidget):
         self.rf_gain_spinbox.setPrefix("RF Gain: ")
         self.rf_gain_spinbox.valueChanged.connect(self.update_rf_gain)
 
-        gain_layout.addWidget(self.if_gain_spinbox)
-        gain_layout.addWidget(self.rf_gain_spinbox)
-        layout.addLayout(gain_layout)
+        control_layout.addWidget(self.if_gain_spinbox)
+        control_layout.addWidget(self.rf_gain_spinbox)
+        layout.addLayout(control_layout)
 
         # Boutons Démarrer / Arrêter
         self.start_button = QtWidgets.QPushButton("Démarrer")
