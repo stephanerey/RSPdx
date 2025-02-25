@@ -4,6 +4,7 @@ import SoapySDR
 from SoapySDR import *
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtWidgets, QtCore, QtGui
+from scipy.signal import lfilter
 
 
 class SDRReceiver:
@@ -33,7 +34,8 @@ class SDRReceiver:
 
         return None
 
-    def compute_spectrum(self, iq_data):
+    def lowpass_filter(self, data, alpha=0.2):
+        return lfilter([alpha], [1, alpha-1], data)
         if len(iq_data) != self.fft_size:
             iq_data = np.pad(iq_data, (0, self.fft_size - len(iq_data)), mode='constant')
 
@@ -151,7 +153,8 @@ class SDRGUI(QtWidgets.QWidget):
     def update_plot(self):
         iq_data = self.receiver.read_samples()
         if iq_data is not None:
-            power_spectrum = self.receiver.compute_spectrum(iq_data)
+            filtered_data = self.receiver.lowpass_filter(iq_data)
+            power_spectrum = self.receiver.compute_spectrum(filtered_data)
             freqs = np.fft.fftshift(np.fft.fftfreq(len(iq_data), 1 / self.receiver.sample_rate))
             freqs += self.receiver.center_freq / 1e6  # Conversion en MHz
 
