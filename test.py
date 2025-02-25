@@ -136,7 +136,10 @@ class SDRGUI(QtWidgets.QWidget):
             freqs = np.fft.fftshift(np.fft.fftfreq(len(iq_data), 1 / self.receiver.sample_rate))
             freqs += self.receiver.center_freq / 1e6  # Conversion en MHz
 
+            ymin = self.ymin_slider.value()
+            ymax = self.ymax_slider.value()
             self.spectrum_curve.setData(freqs, power_spectrum)
+            self.spectrum_plot.setYRange(ymin, ymax)
 
             # **Défilement vertical du waterfall**
             self.receiver.waterfall_data[:-1] = self.receiver.waterfall_data[1:]
