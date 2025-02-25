@@ -103,6 +103,25 @@ class SDRGUI(QtWidgets.QWidget):
 
         layout.addLayout(control_layout)
 
+        # Ajout des spinbox pour contrôler les gains IF et RF
+        gain_layout = QtWidgets.QHBoxLayout()
+
+        self.if_gain_spinbox = QtWidgets.QSpinBox()
+        self.if_gain_spinbox.setRange(20, 59)
+        self.if_gain_spinbox.setValue(40)
+        self.if_gain_spinbox.setPrefix("IF Gain: ")
+        self.if_gain_spinbox.valueChanged.connect(self.update_if_gain)
+
+        self.rf_gain_spinbox = QtWidgets.QSpinBox()
+        self.rf_gain_spinbox.setRange(0, 29)
+        self.rf_gain_spinbox.setValue(15)
+        self.rf_gain_spinbox.setPrefix("RF Gain: ")
+        self.rf_gain_spinbox.valueChanged.connect(self.update_rf_gain)
+
+        gain_layout.addWidget(self.if_gain_spinbox)
+        gain_layout.addWidget(self.rf_gain_spinbox)
+        layout.addLayout(gain_layout)
+
         # Boutons Démarrer / Arrêter
         self.start_button = QtWidgets.QPushButton("Démarrer")
         self.start_button.clicked.connect(self.start_stream)
@@ -173,6 +192,14 @@ class SDRGUI(QtWidgets.QWidget):
         new_rate = self.sample_rate_input.currentData()
         self.receiver.sample_rate = new_rate
         self.receiver.sdr.setSampleRate(SOAPY_SDR_RX, 0, new_rate)
+
+    def update_if_gain(self):
+        self.IFgain = self.if_gain_spinbox.value()
+        self.receiver.sdr.setGain(SOAPY_SDR_RX, 0, "IFGR", self.IFgain)
+
+    def update_rf_gain(self):
+        self.RFgain = self.rf_gain_spinbox.value()
+        self.receiver.sdr.setGain(SOAPY_SDR_RX, 0, "RFGR", self.RFgain)
 
 
 if __name__ == "__main__":
