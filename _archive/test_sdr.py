@@ -3,36 +3,43 @@ import SoapySDR
 from SoapySDR import *
 import numpy as np
 import matplotlib
-matplotlib.use("Qt5Agg")
+matplotlib.use('QT5Agg')
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import matplotlib.ticker as ticker
 import logging
 from PyQt5 import QtWidgets, QtCore
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from scipy.signal import firwin, lfilter
 
 # Configurer le logging
 logging.basicConfig(
-    filename="sdr_debug.log",
+    filename="../sdr_debug.log",
     level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+def lowpass_filter(data, alpha=0.2):
+    return lfilter([alpha], [1, alpha-1], data)
+
 # Classe de réception SDR
 class Receiver:
     def __init__(self):
+        super().__init__()
+        self.fft_buffer = []  # Stocke les FFT pour le moyennage
+        self.waterfall_buffer = []  # Stocke les lignes du waterfall pour le moyennage
+
         try:
             logger.info("Initializing SDRplay device...")
             self.sdr = SoapySDR.Device({"driver": "sdrplay"})
             logger.info("SDRplay device initialized successfully.")
-            print(self.sdr.listGains(SOAPY_SDR_RX, 0))
-            # Valeurs par défaut (en Hz)
+
             self.sample_rate = 1e6
             self.center_freq = 137.1e6
             self.IFgain = 30
-            self.RFgain = 10
-            # Par défaut, on désactive l'AGC (manual gain)
+            self.RFgain = 6
+            self.averaging = 1  # Valeur par défaut (pas de moyennage)
             self.agc = False
             self.update_settings(self.sample_rate, self.center_freq, self.IFgain, self.RFgain, self.agc)
 
@@ -56,24 +63,37 @@ class Receiver:
         self.waterfall = None
         self.waterfall_data = None
 
+    def smooth_waterfall(self, new_data, alpha=0.4):
+        if not hasattr(self, 'smoothed_waterfall'):
+            self.smoothed_waterfall = new_data  # Initialiser
+        self.smoothed_waterfall = alpha * new_data + (1 - alpha) * self.smoothed_waterfall
+        return self.smoothed_waterfall
+
+    def bandpass_filter(self, iq_data, low_cutoff, high_cutoff, sample_rate, num_taps=101):
+        nyquist = sample_rate / 2
+        fir_coeff = firwin(num_taps, [low_cutoff / nyquist, high_cutoff / nyquist], pass_zero=False)
+        return lfilter(fir_coeff, 1.0, iq_data)
+
     def update_plot(self, iq_data):
         try:
-            # Calcul de la FFT et application du décalage avec averaging
-            averaging_factor = self.averaging_spinbox.value()
+            # filtered_iq = self.bandpass_filter(iq_data, 0.1e6, 0.9e6, 2e6)  # Garder de 100 kHz à 900 kHz autour de la fréquence centrale
+            # iq_data = filtered_iq
+            # Calcul de la FFT et application du décalage
+            # window = np.hamming(len(iq_data))
             fft_data = np.fft.fft(iq_data)
             fft_data = np.fft.fftshift(fft_data)
+            # fft_data = np.fft.fftshift(np.fft.fft(iq_data * window))
             power = 20 * np.log10(np.abs(fft_data) + 1e-6)
 
-            # Appliquer l'averaging
-            if not hasattr(self, 'average_power'):
-                self.average_power = power
-            else:
-                self.average_power = (self.average_power * (averaging_factor - 1) + power) / averaging_factor
-
-            power = self.average_power
-            fft_data = np.fft.fft(iq_data)
-            fft_data = np.fft.fftshift(fft_data)
-            power = 20 * np.log10(np.abs(fft_data) + 1e-6)
+            # Nombre d'itérations pour le moyennage
+            avg_count = max(1, self.averaging)  # Assurer un minimum de 1
+            # Moyennage du spectre
+            self.fft_buffer.append(power)
+            if len(self.fft_buffer) > avg_count:
+                self.fft_buffer.pop(0)  # Supprime l'élément le plus ancien
+            avg_fft = np.mean(self.fft_buffer, axis=0) if self.fft_buffer else power
+            # Appliquer le filtre sur la FFT moyenne
+            avg_fft = lowpass_filter(avg_fft, alpha=0.2)
 
             # Calcul des fréquences et recentrage autour de center_freq
             freqs = np.fft.fftfreq(len(iq_data), 1 / self.sample_rate)
@@ -81,13 +101,25 @@ class Receiver:
             freqs += self.center_freq
 
             # Mise à jour du spectre
-            self.line.set_data(freqs, power)
+            self.line.set_data(freqs, avg_fft)
             self.ax1.set_xlim(freqs[0], freqs[-1])
+
+            # Moyennage du waterfall
+            self.waterfall_buffer.append(avg_fft)
+            if len(self.waterfall_buffer) > avg_count:
+                self.waterfall_buffer.pop(0)
+            avg_waterfall = np.mean(self.waterfall_buffer, axis=0) if self.waterfall_buffer else avg_fft
+
+            # Appliquer le filtre sur la nouvelle ligne du waterfall
+            # avg_waterfall = self.smooth_waterfall(avg_waterfall)
+            self.waterfall_data[-1, :] = avg_waterfall
 
             # Mise à jour du waterfall
             self.waterfall_data = np.roll(self.waterfall_data, -1, axis=0)
-            self.waterfall_data[-1, :] = power
+            self.waterfall_data[-1, :] = avg_waterfall
             self.waterfall.set_data(self.waterfall_data)
+
+            # Mettre à jour les limites de couleur du waterfall
             vmin = self.vmin_slider.value()
             vmax = self.vmax_slider.value()
             self.waterfall.set_clim(vmin, vmax)
@@ -131,10 +163,131 @@ class Receiver:
             self.sdr.setFrequency(SOAPY_SDR_RX, 0, self.center_freq)
             self.sdr.setGain(SOAPY_SDR_RX, 0, "IFGR", self.IFgain)
             self.sdr.setGain(SOAPY_SDR_RX, 0, "RFGR", self.RFgain)
+
+            # Sélection du port d'antenne (Port A dans l'image)
+            self.sdr.setAntenna(SOAPY_SDR_RX, 0, "Antenna A")
+
+            # Activation/Désactivation des Notch Filters
+            self.sdr.writeSetting("Notch_MWFM", "true")  # Activer MW/FM Notch
+            self.sdr.writeSetting("Notch_DAB", "true")  # Activer DAB Notch
+            self.sdr.writeSetting("LNAEnable", "true")  # Active le LNA pour une meilleure sensibilité
+
+            # Correction de fréquence (PPM)
+            self.sdr.setFrequencyCorrection(SOAPY_SDR_RX, 0, 2.00)
+
+            # Mode IF (Low IF)
+            self.sdr.writeSetting("IFMode", "Low IF")
+
+            # Bande passante de l'IF (1.536 MHz)
+            self.sdr.setBandwidth(SOAPY_SDR_RX, 0, 1.536e6)
+
+            # Décimation (None)
+            self.sdr.writeSetting("Decimation", "2")  # "1" signifie pas de décimation
+
+            # Setpoint en dBFS (-20 dBFS)
+            self.sdr.writeSetting("Setpoint", "-20")
+
             logger.info("Settings updated:")
             logger.info(f"Sample rate: {self.sample_rate} Hz, Center frequency: {self.center_freq} Hz, IF Gain: {self.IFgain}, RF Gain: {self.RFgain}, AGC: {agc}")
         except Exception as e:
             logger.error(f"Error updating settings: {e}")
+
+    def collect_get_info(self, sdr):
+        """
+        Collecte les informations obtenues via les fonctions 'get...' de l'API SoapySDR.
+        Pour les fonctions renvoyant une plage (Range), le contenu est décodé en clair.
+        """
+        info = {}
+        try:
+            info['driver_key'] = sdr.getDriverKey()
+        except Exception as e:
+            info['driver_key'] = f"Erreur: {e}"
+
+        try:
+            info['hardware_key'] = sdr.getHardwareKey()
+        except Exception as e:
+            info['hardware_key'] = f"Erreur: {e}"
+
+        try:
+            info['hardware_info'] = sdr.getHardwareInfo()
+        except Exception as e:
+            info['hardware_info'] = f"Erreur: {e}"
+
+        # Pour le canal RX 0
+        try:
+            info['antenna_rx_0'] = sdr.getAntenna(SOAPY_SDR_RX, 0)
+        except Exception as e:
+            info['antenna_rx_0'] = f"Erreur: {e}"
+
+        try:
+            info['gain_mode_rx_0'] = sdr.getGainMode(SOAPY_SDR_RX, 0)
+        except Exception as e:
+            info['gain_mode_rx_0'] = f"Erreur: {e}"
+
+        try:
+            info['frequency_rx_0'] = sdr.getFrequency(SOAPY_SDR_RX, 0)
+        except Exception as e:
+            info['frequency_rx_0'] = f"Erreur: {e}"
+
+        try:
+            # Décodage de la plage de fréquence
+            frequency_range = sdr.getFrequencyRange(SOAPY_SDR_RX, 0)
+            info['frequency_range_rx_0'] = decode_range_obj(frequency_range)
+        except Exception as e:
+            info['frequency_range_rx_0'] = f"Erreur: {e}"
+
+        try:
+            info['frequency_correction_rx_0'] = sdr.getFrequencyCorrection(SOAPY_SDR_RX, 0)
+        except Exception as e:
+            info['frequency_correction_rx_0'] = f"Erreur: {e}"
+
+        try:
+            info['sample_rate_rx_0'] = sdr.getSampleRate(SOAPY_SDR_RX, 0)
+        except Exception as e:
+            info['sample_rate_rx_0'] = f"Erreur: {e}"
+
+        try:
+            # Décodage de la plage de taux d'échantillonnage
+            sample_rate_range = sdr.getSampleRateRange(SOAPY_SDR_RX, 0)
+            info['sample_rate_range_rx_0'] = decode_range_obj(sample_rate_range)
+        except Exception as e:
+            info['sample_rate_range_rx_0'] = f"Erreur: {e}"
+
+        try:
+            info['bandwidth_rx_0'] = sdr.getBandwidth(SOAPY_SDR_RX, 0)
+        except Exception as e:
+            info['bandwidth_rx_0'] = f"Erreur: {e}"
+
+        try:
+            # Décodage de la plage de largeur de bande
+            bandwidth_range = sdr.getBandwidthRange(SOAPY_SDR_RX, 0)
+            info['bandwidth_range_rx_0'] = decode_range_obj(bandwidth_range)
+        except Exception as e:
+            info['bandwidth_range_rx_0'] = f"Erreur: {e}"
+
+        try:
+            info['dc_offset_mode_rx_0'] = sdr.getDCOffsetMode(SOAPY_SDR_RX, 0)
+        except Exception as e:
+            info['dc_offset_mode_rx_0'] = f"Erreur: {e}"
+
+        # Fonctions globales ne nécessitant pas de canal
+        try:
+            info['clock_source'] = sdr.getClockSource()
+        except Exception as e:
+            info['clock_source'] = f"Erreur: {e}"
+
+        try:
+            info['hardware_time'] = sdr.getHardwareTime()
+        except Exception as e:
+            info['hardware_time'] = f"Erreur: {e}"
+
+        try:
+            info['sensors_rx_0'] = sdr.listSensors(SOAPY_SDR_RX, 0)
+        except Exception as e:
+            info['sensors_rx_0'] = f"Erreur: {e}"
+
+        return info
+
 
 # Interface principale PyQt
 class MainWindow(QtWidgets.QMainWindow):
@@ -187,7 +340,7 @@ class MainWindow(QtWidgets.QMainWindow):
         RF_layout = QtWidgets.QHBoxLayout()
         RFgain_label = QtWidgets.QLabel("RF Gain:")
         self.RFgain_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.RFgain_slider.setRange(0, 9)
+        self.RFgain_slider.setRange(0, 22)
         self.RFgain_slider.setValue(10)
         self.RFgain_value_label = QtWidgets.QLabel(str(self.RFgain_slider.value()))
         self.RFgain_slider.valueChanged.connect(lambda val: self.RFgain_value_label.setText(str(val)))
@@ -200,15 +353,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.agc_checkbox = QtWidgets.QCheckBox("AGC")
         self.agc_checkbox.setChecked(False)
         control_layout.addWidget(self.agc_checkbox)
-        # Averaging : QSpinBox
-        averaging_label = QtWidgets.QLabel("Averaging:")
-        self.averaging_spinbox = QtWidgets.QSpinBox()
-        self.averaging_spinbox.setRange(1, 100)
-        self.averaging_spinbox.setValue(1)
-        control_layout.addWidget(averaging_label)
-        control_layout.addWidget(self.averaging_spinbox)
-
-        # Sliders layout
         sliders_layout = QtWidgets.QHBoxLayout()
 
         # Sliders pour vmin et vmax du waterfall
@@ -279,6 +423,17 @@ class MainWindow(QtWidgets.QMainWindow):
         main_layout.addLayout(control_layout)
         main_layout.addLayout(sliders_layout)
 
+        # Moyennage (Averaging)
+        avg_layout = QtWidgets.QHBoxLayout()
+        avg_label = QtWidgets.QLabel("Averaging:")
+        self.averaging_spinbox = QtWidgets.QSpinBox()
+        self.averaging_spinbox.setRange(1, 100)  # Min = 1 (pas de filtrage), Max = 100
+        self.averaging_spinbox.setValue(1)  # Par défaut, pas de filtrage
+        self.averaging_spinbox.valueChanged.connect(self.update_averaging)  # 🔥 Connexion dynamique
+        avg_layout.addWidget(avg_label)
+        avg_layout.addWidget(self.averaging_spinbox)
+        control_layout.addLayout(avg_layout)
+
         # Connexions pour mettre à jour automatiquement en fonction des modifications sur les sliders
         self.vmin_slider.valueChanged.connect(self.update_waterfall_limits)
         self.vmax_slider.valueChanged.connect(self.update_waterfall_limits)
@@ -290,10 +445,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.IFgain_slider.valueChanged.connect(self.apply_settings)
         self.RFgain_slider.valueChanged.connect(self.apply_settings)
 
+
         # Zone d'affichage Matplotlib (plots)
         self.figure, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'hspace': 0.1})
         self.canvas = FigureCanvas(self.figure)
         main_layout.addWidget(self.canvas)
+
+    def update_averaging(self):
+        """
+        Met à jour la valeur du moyennage dans la classe Receiver lorsque l'utilisateur change le QSpinBox.
+        Purge les buffers si la valeur de l'averaging diminue pour éviter les moyennes sur trop d'échantillons.
+        """
+        new_avg = self.averaging_spinbox.value()
+
+        if new_avg < self.receiver.averaging:  # 🔥 Si on réduit l'averaging, on purge les buffers
+            self.receiver.fft_buffer.clear()
+            self.receiver.waterfall_buffer.clear()
+
+        self.receiver.averaging = new_avg  # Met à jour l'averaging
+        logger.info(f"Averaging updated to: {self.receiver.averaging}")
+
+        # Forcer une mise à jour de l'affichage
+        self.canvas.draw_idle()
 
     def init_plot(self):
         # Formatter pour afficher en MHz
@@ -355,6 +528,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                    0, speed])
         self.ax2.set_ylim(0, speed)
         self.canvas.draw_idle()
+
     def apply_settings(self):
         # Récupérer et convertir les valeurs depuis les widgets
         sample_rate_mhz = float(self.sample_rate_combo.currentText())
@@ -363,6 +537,8 @@ class MainWindow(QtWidgets.QMainWindow):
         IFgain = self.IFgain_slider.value()
         RFgain = self.RFgain_slider.value()
         agc = self.agc_checkbox.isChecked()
+
+
         try:
             # Récupérer et convertir les valeurs depuis les widgets
             sample_rate_mhz = float(self.sample_rate_combo.currentText())

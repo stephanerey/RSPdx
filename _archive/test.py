@@ -4,20 +4,61 @@ import SoapySDR
 from SoapySDR import *
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtWidgets, QtCore, QtGui
-from scipy.signal import lfilter
-
+from scipy.signal import firwin, lfilter
+from sdr import SDRController
+import threading, time
 
 class SDRReceiver:
-    def __init__(self):
-        self.sdr = SoapySDR.Device({"driver": "sdrplay"})
-        self.sample_rate = 2e6
-        self.center_freq = 137.1e6
-        self.waterfall_size = 300  # Nombre de lignes du waterfall
-        self.fft_size = 2048  # Taille de la FFT
-        self.waterfall_data = np.zeros((self.waterfall_size, self.fft_size))
+    new_data = QtCore.pyqtSignal(object, object)  # Signal pour envoyer (fréquence, puissance)
 
-        self.rx_stream = self.sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
-        self.sdr.activateStream(self.rx_stream)
+    def __init__(self, sample_rate=2e6, center_freq=137.1e6, buff_size=1024):
+        super().__init__()
+        self.running = False
+        self.sample_rate = sample_rate
+        self.center_freq = center_freq
+        self.buff_size = buff_size
+        self.sdr = None
+        self.thread = None
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join()
+
+    def run(self):
+        try:
+            self.sdr = SoapySDR.Device({"driver": "sdrplay"})
+            self.sdr.setSampleRate(SOAPY_SDR_RX, 0, self.sample_rate)
+            self.sdr.setFrequency(SOAPY_SDR_RX, 0, self.center_freq)
+            self.sdr.setGainMode(SOAPY_SDR_RX, 0, False)
+
+            stream = self.sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
+            self.sdr.activateStream(stream)
+
+            buffer = np.zeros(self.buff_size, dtype=np.complex64)
+            while self.running:
+                sr = self.sdr.readStream(stream, [buffer], self.buff_size)
+                if sr.ret > 0:
+                    fft_data = np.fft.fftshift(np.fft.fft(buffer))
+                    power = 20 * np.log10(np.abs(fft_data) + 1e-6)
+                    freqs = np.fft.fftfreq(len(buffer), 1 / self.sample_rate)
+                    freqs = np.fft.fftshift(freqs) + self.center_freq / 1e6
+                    self.new_data.emit(freqs, power)
+                time.sleep(0.01)  # Réduction de charge CPU
+
+            self.sdr.deactivateStream(stream)
+            self.sdr.closeStream(stream)
+
+        except Exception as e:
+            print(f"Erreur SDR : {e}")
+            self.running = False
 
     def read_samples(self):
         expected_len = self.fft_size
@@ -35,11 +76,14 @@ class SDRReceiver:
         return None
 
     def lowpass_filter(self, data, alpha=0.2):
-        return lfilter([alpha], [1, alpha-1], data)
+        return lfilter([alpha], [1, alpha - 1], data)
+
+    def compute_spectrum(self, iq_data):
         if len(iq_data) != self.fft_size:
             iq_data = np.pad(iq_data, (0, self.fft_size - len(iq_data)), mode='constant')
 
         fft_data = np.fft.fftshift(np.fft.fft(iq_data, self.fft_size))
+        fft_data = self.lowpass_filter(fft_data, alpha=0.2)
         power_spectrum = 20 * np.log10(np.abs(fft_data) + 1e-6)
         return power_spectrum
 
@@ -153,8 +197,7 @@ class SDRGUI(QtWidgets.QWidget):
     def update_plot(self):
         iq_data = self.receiver.read_samples()
         if iq_data is not None:
-            filtered_data = self.receiver.lowpass_filter(iq_data)
-            power_spectrum = self.receiver.compute_spectrum(filtered_data)
+            power_spectrum = self.receiver.compute_spectrum(iq_data)
             freqs = np.fft.fftshift(np.fft.fftfreq(len(iq_data), 1 / self.receiver.sample_rate))
             freqs += self.receiver.center_freq / 1e6  # Conversion en MHz
 
