@@ -31,13 +31,21 @@ class SDRController(QObject):
         self._last_stream_error_log = 0.0
         self._timeout_code = int(getattr(SoapySDR, "SOAPY_SDR_TIMEOUT", -1))
         self._last_plot_push = 0.0
-        self._plot_interval_s = 1.0 / 20.0  # limiter l'UI spectre/waterfall à ~20 FPS
+        self._plot_interval_s = 1.0 / 20.0  # proche du profil visuel SDR++
+        self._fft_db_ema = None
+        self._fft_ema_alpha = 1.0
+        self._fft_win = None
+        self._fft_win_size = 0
+        self._fft_win_power = 1.0
+        self._freq_axis = None
+        self._freq_axis_key = None
 
         # Réglages
         self.sample_rate = float(sample_rate)
         self.center_freq = float(center_freq)
         self.buff_size   = int(buff_size)
-        self.fft_size    = int(buff_size)
+        # FFT d'affichage: taille adaptative pour meilleure résolution fréquentielle.
+        self.fft_size    = self._select_fft_size(self.sample_rate, self.buff_size)
 
         # Matériel / infos
         self.sdr = None
@@ -61,23 +69,162 @@ class SDRController(QObject):
 
     # ---- Device init (robuste) ----
     def _init_device(self):
-        self.hwinfo['devices'] = SoapySDR.Device_enumerate()
+        # Infos modules Soapy (diagnostic utile en cas de non-détection).
+        self.hwinfo["modules"] = []
         try:
-            self.sdr = SoapySDR.Device(dict(driver="sdrplay"))
+            lm = getattr(SoapySDR, "listModules", None)
+            if callable(lm):
+                mods = lm()
+                if isinstance(mods, (list, tuple)):
+                    self.hwinfo["modules"] = [str(m) for m in mods]
+        except Exception:
+            self.hwinfo["modules"] = []
+
+        # Enumerate all devices first (robuste aux variations de drivers Soapy).
+        try:
+            devices = SoapySDR.Device_enumerate()
         except Exception as e:
-            self.sdr = None
-            print(f"[WARN] No SDRPlay device: {e} — running in dummy mode.")
+            devices = []
+            print(f"[WARN] Soapy enumerate failed: {e}")
+        # Essais d'énumération ciblés SDRplay si l'énumération globale est vide.
+        if not devices:
+            for args in (dict(driver="sdrplay"), dict(driver="sdrplay_api")):
+                try:
+                    d2 = SoapySDR.Device_enumerate(args)
+                    if d2:
+                        devices = d2
+                        break
+                except Exception:
+                    pass
+        self.hwinfo['devices'] = devices
+
+        def _looks_like_sdrplay(dev) -> bool:
+            if not isinstance(dev, dict):
+                return False
+            txt = " ".join(str(v).lower() for v in dev.values())
+            return ("sdrplay" in txt) or ("rsp" in txt)
+
+        opened = None
+        open_errs = []
+
+        # 1) Ouvrir directement un device trouvé à l'énumération.
+        for dev in devices:
+            if not _looks_like_sdrplay(dev):
+                continue
+            try:
+                opened = SoapySDR.Device(dev)
+                self.hwinfo["selected_device"] = dict(dev)
+                break
+            except Exception as e:
+                open_errs.append(f"enum-open {dev}: {e}")
+
+        # 2) Fallbacks par driver key (selon install Soapy/SDRplay).
+        if opened is None:
+            for args in (dict(driver="sdrplay"), dict(driver="sdrplay_api")):
+                try:
+                    opened = SoapySDR.Device(args)
+                    self.hwinfo["selected_device"] = dict(args)
+                    break
+                except Exception as e:
+                    open_errs.append(f"driver-open {args}: {e}")
+
+        # 3) Dernier fallback: device par défaut.
+        if opened is None:
+            try:
+                opened = SoapySDR.Device()
+                info = opened.getHardwareInfo() if hasattr(opened, "getHardwareInfo") else {}
+                if isinstance(info, dict):
+                    txt = " ".join(str(v).lower() for v in info.values())
+                    if ("sdrplay" in txt) or ("rsp" in txt):
+                        self.hwinfo["selected_device"] = dict(info)
+                    else:
+                        # Device par défaut non-SDRplay: ne pas l'utiliser.
+                        opened = None
+            except Exception as e:
+                open_errs.append(f"default-open: {e}")
+
+        self.sdr = opened
+        if self.sdr is None:
+            print("[WARN] No SDRPlay device opened — running in dummy mode.")
+            if open_errs:
+                print("[WARN] SDRPlay open attempts:")
+                for msg in open_errs[:8]:
+                    print("  -", msg)
+            mods = [m.lower() for m in self.hwinfo.get("modules", [])]
+            if mods and (not any("sdrplay" in m for m in mods)):
+                print("[WARN] Soapy module list does not contain SDRplay. Installed modules:")
+                for m in self.hwinfo.get("modules", [])[:20]:
+                    print("  -", m)
 
         if self.sdr is not None:
             # Infos réelles
-            self.hwinfo['antennas']    = self.sdr.listAntennas(SOAPY_SDR_RX, 0)
-            self.hwinfo['gainRange']   = self.sdr.getGainRange(SOAPY_SDR_RX, 0)
-            self.hwinfo['sampleRates'] = self.sdr.listSampleRates(SOAPY_SDR_RX, 0)
+            try:
+                self.hwinfo['antennas'] = self.sdr.listAntennas(SOAPY_SDR_RX, 0)
+            except Exception:
+                self.hwinfo['antennas'] = ["Antenna A", "Antenna B"]
+            try:
+                self.hwinfo['gainRange'] = self.sdr.getGainRange(SOAPY_SDR_RX, 0)
+            except Exception:
+                self.hwinfo['gainRange'] = None
+            try:
+                srs = self.sdr.listSampleRates(SOAPY_SDR_RX, 0)
+                self.hwinfo['sampleRates'] = srs if srs else [self.sample_rate]
+            except Exception:
+                self.hwinfo['sampleRates'] = [self.sample_rate]
         else:
             # Valeurs par défaut en dummy
             self.hwinfo['antennas']    = ["Antenna A", "Antenna B"]
             self.hwinfo['gainRange']   = None
             self.hwinfo['sampleRates'] = [self.sample_rate]
+
+    @staticmethod
+    def _select_fft_size(fs_hz: float, buff_size: int) -> int:
+        """
+        Choix adaptatif de la FFT d'affichage.
+        Vise une RBW ~80 Hz tout en restant borné pour préserver la fluidité.
+        """
+        fs = float(max(1.0, fs_hz))
+        bsz = int(max(1024, buff_size))
+        target_rbw_hz = 40.0 if fs <= 4_000_000.0 else 180.0
+        max_fft = 65536 if fs <= 4_000_000.0 else 32768
+        n_target = int(2 ** np.ceil(np.log2(fs / target_rbw_hz)))
+        n_target = max(2048, n_target)
+        n_target = min(bsz, n_target)
+        n_target = min(max_fft, n_target)
+        # sécurité puissance de 2
+        n_pow2 = int(2 ** int(np.floor(np.log2(max(2, n_target)))))
+        return int(max(1024, n_pow2))
+
+    @staticmethod
+    def _fft_max_for_fs(fs_hz: float, buff_size: int) -> int:
+        fs = float(max(1.0, fs_hz))
+        bsz = int(max(1024, buff_size))
+        max_fft = 65536 if fs <= 4_000_000.0 else 32768
+        return int(min(bsz, max_fft))
+
+    def update_fft_for_view(self, visible_span_hz: float, pixel_width: int):
+        fs = float(max(1.0, self.sample_rate))
+        span = float(max(1.0, min(abs(visible_span_hz), fs)))
+        width_px = int(max(128, pixel_width))
+
+        base_fft = self._select_fft_size(fs, self.buff_size)
+        max_fft = self._fft_max_for_fs(fs, self.buff_size)
+
+        # Sur-échantillonnage d'affichage: plusieurs bins FFT pour un pixel visible.
+        zoom_target = fs * float(width_px) * 6.0 / span
+        zoom_fft = int(2 ** np.ceil(np.log2(max(1024.0, zoom_target))))
+        desired = int(min(max_fft, max(base_fft, zoom_fft)))
+
+        if desired == int(self.fft_size):
+            return
+
+        self.fft_size = desired
+        self._fft_win = None
+        self._fft_win_size = 0
+        self._fft_win_power = 1.0
+        self._fft_db_ema = None
+        self._freq_axis = None
+        self._freq_axis_key = None
 
     # ---- Cycle de vie ----
     def start(self):
@@ -116,9 +263,15 @@ class SDRController(QObject):
                     self.iq_block.emit(buffer.copy())
                     now = time.monotonic()
                     if now - self._last_plot_push >= self._plot_interval_s:
-                        power = self.compute_spectrum(buffer)
-                        freqs = np.fft.fftshift(np.fft.fftfreq(len(power), 1 / fs)) + self.center_freq
-                        self.data_storage.update({"timestamp": t, "x": freqs, "y": power})
+                        try:
+                            power = self.compute_spectrum(buffer)
+                            freqs = self._get_freq_axis(len(power), fs)
+                            self.data_storage.update({"timestamp": t, "x": freqs, "y": power})
+                        except Exception as e:
+                            now_err = time.monotonic()
+                            if now_err - self._last_stream_error_log >= 1.0:
+                                print(f"[SDR] spectrum compute error (dummy): {e}")
+                                self._last_stream_error_log = now_err
                         self._last_plot_push = now
 
                     t += 1
@@ -147,10 +300,16 @@ class SDRController(QObject):
                     self.iq_block.emit(iq)
                     now = time.monotonic()
                     if now - self._last_plot_push >= self._plot_interval_s:
-                        power = self.compute_spectrum(iq)
-                        fs = float(self.sample_rate)
-                        freqs = np.fft.fftshift(np.fft.fftfreq(len(power), 1 / fs)) + self.center_freq
-                        self.data_storage.update({"timestamp": now, "x": freqs, "y": power})
+                        try:
+                            power = self.compute_spectrum(iq)
+                            fs = float(self.sample_rate)
+                            freqs = self._get_freq_axis(len(power), fs)
+                            self.data_storage.update({"timestamp": now, "x": freqs, "y": power})
+                        except Exception as e:
+                            now_err = time.monotonic()
+                            if now_err - self._last_stream_error_log >= 1.0:
+                                print(f"[SDR] spectrum compute error (hw): {e}")
+                                self._last_stream_error_log = now_err
                         self._last_plot_push = now
                 elif sr.ret == self._timeout_code:
                     time.sleep(0.001)
@@ -195,6 +354,8 @@ class SDRController(QObject):
 
     def set_frequency(self, frequency):
         self.center_freq = float(frequency)
+        self._freq_axis = None
+        self._freq_axis_key = None
         if self.sdr is not None:
             self.sdr.setFrequency(SOAPY_SDR_RX, 0, self.center_freq)
         self.center_frequency_changed.emit(self.center_freq)
@@ -217,6 +378,9 @@ class SDRController(QObject):
 
         # 3) appliquer côté HW
         self.sample_rate = new_sample_rate
+        self.fft_size = self._select_fft_size(self.sample_rate, self.buff_size)
+        self._freq_axis = None
+        self._freq_axis_key = None
         if self.sdr is not None:
             try:
                 self.sdr.setSampleRate(SOAPY_SDR_RX, 0, self.sample_rate)
@@ -239,13 +403,71 @@ class SDRController(QObject):
             self.sdr.setAntenna(SOAPY_SDR_RX, 0, self.antenna)
 
     # ---- Spectre ----
+    @staticmethod
+    def _blackman_window(n: int) -> np.ndarray:
+        """
+        Fenetre Blackman explicite pour rapprocher le rendu SDR++.
+        """
+        n = int(max(1, n))
+        if n == 1:
+            return np.ones(1, dtype=np.float32)
+        a0, a1, a2 = 0.42, 0.5, 0.08
+        k = np.arange(n, dtype=np.float32)
+        x = (2.0 * np.pi * k) / float(n - 1)
+        w = a0 - a1 * np.cos(x) + a2 * np.cos(2.0 * x)
+        return w.astype(np.float32, copy=False)
+
+    def _ensure_fft_window(self):
+        n = int(max(8, self.fft_size))
+        if self._fft_win is not None and self._fft_win_size == n:
+            return
+        w = self._blackman_window(n)
+        pw = float(np.sum(w * w))
+        if pw <= 1e-12:
+            pw = 1.0
+        self._fft_win = w
+        self._fft_win_size = n
+        self._fft_win_power = pw
+        self._fft_db_ema = None
+        self._freq_axis = None
+        self._freq_axis_key = None
+
+    def _get_freq_axis(self, n_bins: int, fs: float) -> np.ndarray:
+        key = (int(n_bins), float(fs), float(self.center_freq))
+        if self._freq_axis is not None and self._freq_axis_key == key:
+            return self._freq_axis
+        freqs = np.fft.fftshift(np.fft.fftfreq(int(n_bins), 1.0 / float(fs))).astype(np.float64)
+        freqs += float(self.center_freq)
+        self._freq_axis = freqs
+        self._freq_axis_key = key
+        return freqs
+
     def compute_spectrum(self, iq_data):
-        if len(iq_data) != self.fft_size:
-            iq_data = np.pad(iq_data, (0, self.fft_size - len(iq_data)), mode='constant')
-        fft_data = np.fft.fftshift(np.fft.fft(iq_data, self.fft_size))
-        fft_data = self._ema_filter(fft_data, alpha=0.1)  # lissage léger
-        power_spectrum = 20 * np.log10(np.abs(fft_data) + 1e-6)
-        return power_spectrum
+        nfft = int(max(8, self.fft_size))
+        self._ensure_fft_window()
+
+        x = np.asarray(iq_data, dtype=np.complex64)
+        if x.size < nfft:
+            x = np.pad(x, (0, nfft - x.size), mode='constant')
+        elif x.size > nfft:
+            x = x[:nfft]
+
+        # Fenêtrage simple; le centrage fréquentiel est assuré par fftshift au retour.
+        x = x * self._fft_win
+
+        fft_data = np.fft.fft(x, nfft)
+        p_lin = (np.abs(fft_data) ** 2).astype(np.float32, copy=False)
+        p_lin = p_lin / max(1.0, self._fft_win_power * float(nfft))
+        p_db = 10.0 * np.log10(p_lin + 1e-12)
+
+        # EMA stateful sur le spectre en dB (inspiré du smoothing SDR++).
+        if self._fft_db_ema is None or self._fft_db_ema.shape != p_db.shape:
+            self._fft_db_ema = p_db.copy()
+        else:
+            a = float(np.clip(self._fft_ema_alpha, 0.01, 1.0))
+            self._fft_db_ema = (1.0 - a) * self._fft_db_ema + a * p_db
+
+        return np.fft.fftshift(self._fft_db_ema).astype(np.float32, copy=False)
 
     @staticmethod
     def _ema_filter(data, alpha=0.2):

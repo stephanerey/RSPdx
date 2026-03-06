@@ -46,6 +46,7 @@ class ReceiverTab(QtWidgets.QWidget):
         self.symbolRateSpin.setValue(18.000)
         self.syncLabel = QtWidgets.QLabel("Sync: -- | EVM: --")
         self.syncLabel.setStyleSheet("color: #cccccc;")
+        self.syncLabel.setWordWrap(True)
 
         form.addRow("Selected frequency:", self.freqSpin)
         form.addRow("Bandwidth:", self.bwSpin)
@@ -262,11 +263,37 @@ class ReceiverTab(QtWidgets.QWidget):
     def _on_quality_updated(self, info: dict):
         state = str(info.get("state", "SEARCH"))
         evm = float(info.get("evm_pct", float("nan")))
+        evm_rad = float(info.get("evm_rad_pct", float("nan")))
+        evm_tan = float(info.get("evm_tan_pct", float("nan")))
+        evm_rt = float(info.get("evm_rt_ratio", float("nan")))
+        mer = float(info.get("mer_db", float("nan")))
         cmet = float(info.get("lock_metric", 0.0))
         sps = float(info.get("sps", 0.0))
+        sps_nom = float(info.get("sps_nom", sps))
+        sps_off_ppm = float(info.get("sps_off_ppm", 0.0))
         iq_imb = float(info.get("iq_imbalance", 0.0))
+        cfo_hz = float(info.get("cfo_hz", 0.0))
+        cfo_ppm = float(info.get("cfo_ppm", 0.0))
+        ted_std = float(info.get("ted_std", 0.0))
+        t_corr = float(info.get("timing_corr", 0.0))
+        t_clips = int(info.get("timing_clips", 0))
+        ecc = float(info.get("cluster_ecc", 0.0))
+        eq_on = bool(info.get("eq_on", False))
+        eq_err = float(info.get("eq_err", 0.0))
+        eq_upd = float(info.get("eq_upd", 0.0))
+        costas_act = bool(info.get("costas_active", False))
+        hist = info.get("phase_hist", [0.0, 0.0, 0.0, 0.0])
+        try:
+            h_txt = "/".join(f"{int(round(100.0 * float(v))):02d}" for v in list(hist)[:4])
+        except Exception:
+            h_txt = "--/--/--/--"
         self.syncLabel.setText(
-            f"Sync: {state} | EVM: {evm:.1f}% | C: {cmet:.2f} | sps: {sps:.3f} | IQ: {iq_imb:.3f}"
+            f"Sync: {state} | EVM: {evm:.1f}% (Er:{evm_rad:.1f} Et:{evm_tan:.1f} R/T:{evm_rt:.2f}) | "
+            f"MER: {mer:.1f} dB | C: {cmet:.2f} | sps: {sps:.3f} (nom:{sps_nom:.3f}, off:{sps_off_ppm:+.0f} ppm)\n"
+            f"CFO: {cfo_hz:+.1f} Hz ({cfo_ppm:+.3f} ppm) | TEDσ: {ted_std:.3f} | Tcorr: {t_corr:+.4f} | "
+            f"clips: {t_clips} | Ecc: {ecc:.2f} | H4: {h_txt} | IQ: {iq_imb:.3f} | "
+            f"Costas:{'ON' if costas_act else 'OFF'} | EQ:{'ON' if eq_on else 'OFF'} "
+            f"(err:{eq_err:.3f} upd:{eq_upd:.4f})"
         )
         if state == "LOCK":
             color = "#80ff80"

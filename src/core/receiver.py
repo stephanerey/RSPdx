@@ -70,6 +70,8 @@ class Receiver(QObject):
         self.num_taps = int(num_taps)
 
         # État DSP sous-bande
+        self._pre_decim = 1
+        self._pre_residual = np.zeros(0, dtype=np.complex64)
         self._decim = 1                    # facteur entier de décimation (input -> bb)
         self._fs_bb = float(sample_rate)   # fs après décimation
         self._taps_cache = None
@@ -81,6 +83,7 @@ class Receiver(QObject):
         self._sym_phase = 0.0
         self._costas_phase = 0.0
         self._costas_freq = 0.0
+        self._costas_active_last = False
         self.costas_loop_bw = 0.02
         self.costas_damping = 0.707
         self._prev_const_sample = None
@@ -89,6 +92,18 @@ class Receiver(QObject):
         self._timing_gain = 0.008
         self._timing_conf = 0.0
         self._timing_reacq_ctr = 0
+        self._ted_mean = 0.0
+        self._ted_std = 0.0
+        self._timing_corr_norm = 0.0
+        self._timing_clip_events = 0
+        self._sps_offset = 0.0
+        self._eq_enabled = False
+        self._eq_mu = 0.00025
+        self._eq_ntaps = 7
+        self._eq_w = None
+        self._eq_buf = None
+        self._eq_err_rms = 0.0
+        self._eq_upd_norm = 0.0
         self._last_quality_emit = 0.0
         self._quality_interval_s = 0.20
 
@@ -250,14 +265,17 @@ class Receiver(QObject):
             self.modulation_profile = p
             if p == "tetra":
                 self.symbol_rate = 18_000.0
-                self._timing_gain = 0.004
+                self._timing_gain = 0.0018
                 self.enable_costas = True
                 self.costas_mode = "qpsk"
                 self.iq_correction_enabled = True
                 self.costas_loop_bw = 0.008
+                # EQ adaptatif désactivé: il déstabilise encore la chaîne.
+                self._eq_enabled = False
             else:
                 self._timing_gain = 0.008
                 self.costas_loop_bw = 0.02
+                self._eq_enabled = False
 
             if self.demod is not None and hasattr(self.demod, "begin_reconfig"):
                 try:
@@ -271,6 +289,7 @@ class Receiver(QObject):
             self._tetra_rs_q = None
             self._tetra_rs_in = 0.0
             self._tetra_rs_out = 0.0
+            self._reset_equalizer_state()
             self._sym_phase = 0.0
             self._reset_constellation_state()
 
@@ -313,11 +332,28 @@ class Receiver(QObject):
     def _reset_costas_state(self):
         self._costas_phase = 0.0
         self._costas_freq = 0.0
+        self._costas_active_last = False
 
     def _reset_constellation_state(self):
         self._prev_const_sample = None
         self._timing_conf = 0.0
         self._timing_reacq_ctr = 0
+        self._ted_mean = 0.0
+        self._ted_std = 0.0
+        self._timing_corr_norm = 0.0
+        self._timing_clip_events = 0
+        self._sps_offset = 0.0
+        self._reset_equalizer_state()
+
+    def _reset_equalizer_state(self):
+        nt = int(max(3, self._eq_ntaps))
+        if (nt % 2) == 0:
+            nt += 1
+        self._eq_w = np.zeros(nt, dtype=np.complex64)
+        self._eq_w[nt // 2] = 1.0 + 0.0j
+        self._eq_buf = np.zeros(nt, dtype=np.complex64)
+        self._eq_err_rms = 0.0
+        self._eq_upd_norm = 0.0
 
     @staticmethod
     def _design_rrc_taps(alpha: float, sps: int, span_symbols: int) -> np.ndarray:
@@ -420,11 +456,28 @@ class Receiver(QObject):
         frac = float(t - i0)
         return (1.0 - frac) * x[i0] + frac * x[i0 + 1]
 
+    @staticmethod
+    def _sanitize_complex(x: np.ndarray, max_abs: float = 100.0) -> np.ndarray:
+        if x is None or x.size == 0:
+            return np.zeros(0, dtype=np.complex64)
+        y = x.astype(np.complex64, copy=False)
+        fin = np.isfinite(np.real(y)) & np.isfinite(np.imag(y))
+        if not np.all(fin):
+            y = y.copy()
+            y[~fin] = 0.0 + 0.0j
+        a = np.abs(y)
+        if a.size:
+            clip = a > float(max_abs)
+            if np.any(clip):
+                y = y.copy()
+                y[clip] *= (float(max_abs) / (a[clip] + 1e-12))
+        return y
+
     def _apply_iq_correction(self, x: np.ndarray) -> np.ndarray:
         if x is None or x.size < 2:
             return np.zeros(0, dtype=np.complex64)
 
-        y = x.astype(np.complex64, copy=False)
+        y = self._sanitize_complex(x, max_abs=100.0)
         y = y - np.mean(y)
         if not self.iq_correction_enabled:
             return y
@@ -442,12 +495,57 @@ class Receiver(QObject):
             yc = yc / np.sqrt(g)
         return yc.astype(np.complex64, copy=False)
 
+    @staticmethod
+    def _phase_histogram_quadrants(ph: np.ndarray) -> np.ndarray:
+        if ph is None or ph.size == 0:
+            return np.zeros(4, dtype=np.float32)
+        ph = ph[np.isfinite(ph)]
+        if ph.size == 0:
+            return np.zeros(4, dtype=np.float32)
+        c4 = np.mean(np.exp(1j * 4.0 * ph))
+        phi = 0.25 * float(np.angle(c4 + 1e-12))
+        pha = (ph - phi + np.pi) % (2.0 * np.pi) - np.pi
+        idx = np.mod(np.floor((pha + np.pi / 4.0) / (np.pi / 2.0)).astype(np.int32), 4)
+        h = np.bincount(idx, minlength=4).astype(np.float32)
+        s = float(np.sum(h))
+        if s > 0.0:
+            h /= s
+        return h
+
+    @staticmethod
+    def _qpsk_cluster_eccentricity(points: np.ndarray) -> float:
+        if points is None or points.size < 48:
+            return 0.0
+        pr = Receiver._sanitize_complex(points, max_abs=20.0)
+        if pr.size < 48:
+            return 0.0
+        phi = 0.25 * np.angle(np.mean(pr ** 4) + 1e-12)
+        pr = pr * np.exp(-1j * phi)
+        labels = (np.real(pr) >= 0.0).astype(np.int32) * 2 + (np.imag(pr) >= 0.0).astype(np.int32)
+        ratios = []
+        for k in range(4):
+            pts = pr[labels == k]
+            if pts.size < 10:
+                continue
+            xy = np.column_stack((np.real(pts), np.imag(pts))).astype(np.float64, copy=False)
+            cov = np.cov(xy, rowvar=False)
+            if cov.shape != (2, 2):
+                continue
+            w = np.linalg.eigvalsh(cov)
+            w = np.sort(np.maximum(w, 1e-12))
+            ratios.append(float(np.sqrt(w[1] / w[0])))
+        if not ratios:
+            return 0.0
+        return float(np.mean(ratios))
+
     def _compute_quality(self, points: np.ndarray, fs_for_sps: Optional[float] = None) -> Optional[dict]:
         if points is None or points.size < 32:
             return None
-        p = points.astype(np.complex64, copy=False)
+        p = self._sanitize_complex(points, max_abs=20.0)
+        if p.size < 32:
+            return None
         rms = float(np.sqrt(np.mean(np.abs(p) ** 2)))
-        if rms <= 1e-9:
+        if (not np.isfinite(rms)) or rms <= 1e-9:
             return None
         p = p / rms
 
@@ -463,6 +561,7 @@ class Receiver(QObject):
         if mode == "bpsk":
             phi = 0.5 * np.angle(np.mean(p ** 2) + 1e-12)
             pr = p * np.exp(-1j * phi)
+            pr = self._sanitize_complex(pr, max_abs=8.0)
             ideal = np.where(np.real(pr) >= 0.0, 1.0 + 0.0j, -1.0 + 0.0j).astype(np.complex64)
             c_metric = float(np.abs(np.mean((pr / (np.abs(pr) + 1e-12)) ** 2)))
             c_thr_lock = 0.75
@@ -470,17 +569,36 @@ class Receiver(QObject):
         else:
             phi = 0.25 * np.angle(np.mean(p ** 4) + 1e-12)
             pr = p * np.exp(-1j * phi)
+            pr = self._sanitize_complex(pr, max_abs=8.0)
             re = np.where(np.real(pr) >= 0.0, 1.0, -1.0)
             im = np.where(np.imag(pr) >= 0.0, 1.0, -1.0)
             ideal = ((re + 1j * im) / np.sqrt(2.0)).astype(np.complex64)
             c_metric = float(np.abs(np.mean((pr / (np.abs(pr) + 1e-12)) ** 4)))
             c_thr_lock = 0.70 if self.modulation_profile == "tetra" else 0.55
             c_thr_weak = 0.50
+        if not np.isfinite(c_metric):
+            c_metric = 0.0
 
         evm = float(
             np.sqrt(np.mean(np.abs(pr - ideal) ** 2)) /
             (np.sqrt(np.mean(np.abs(ideal) ** 2)) + 1e-12) * 100.0
         )
+        if not np.isfinite(evm):
+            evm = 999.0
+        # Décomposition EVM: composante radiale (amplitude) vs tangentielle (phase/timing).
+        e = (pr - ideal).astype(np.complex64, copy=False)
+        u = (ideal / (np.abs(ideal) + 1e-12)).astype(np.complex64, copy=False)
+        e_rad = np.real(e * np.conj(u)).astype(np.float32, copy=False)
+        e_tan = np.imag(e * np.conj(u)).astype(np.float32, copy=False)
+        evm_rad = float(np.sqrt(np.mean(e_rad * e_rad)) * 100.0)
+        evm_tan = float(np.sqrt(np.mean(e_tan * e_tan)) * 100.0)
+        if not np.isfinite(evm_rad):
+            evm_rad = 999.0
+        if not np.isfinite(evm_tan):
+            evm_tan = 999.0
+        evm_rt_ratio = float(evm_rad / max(1e-6, evm_tan))
+        if not np.isfinite(evm_rt_ratio):
+            evm_rt_ratio = 0.0
         if c_metric >= c_thr_lock and evm <= 40.0:
             state = "LOCK"
         elif c_metric >= c_thr_weak and evm <= 70.0:
@@ -490,16 +608,65 @@ class Receiver(QObject):
 
         lock = bool(state == "LOCK")
         fs_eff = float(fs_for_sps) if (fs_for_sps is not None and fs_for_sps > 0.0) else float(self._fs_bb)
-        sps = float(fs_eff / max(1.0, self.symbol_rate))
+        sps_nom = float(fs_eff / max(1.0, self.symbol_rate))
+        sps = float(sps_nom + self._sps_offset)
+        sps_off_ppm = float((self._sps_offset / max(1e-9, sps_nom)) * 1e6)
+        evm_rms = max(1e-6, evm / 100.0)
+        mer_db = float(-20.0 * np.log10(evm_rms))
+
+        # CFO résiduel de la boucle Costas (rad/sample -> Hz).
+        cfo_hz = float(self._costas_freq * fs_eff / (2.0 * np.pi))
+        cfo_ppm = float(cfo_hz / max(1.0, abs(self._selected_freq)) * 1e6)
+        if not np.isfinite(cfo_hz):
+            cfo_hz = 0.0
+        if not np.isfinite(cfo_ppm):
+            cfo_ppm = 0.0
+
+        # Histogramme de phase différentielle (4 quadrants).
+        if self.constellation_domain == "differential":
+            dph_src = p
+        else:
+            if p.size < 2:
+                dph_src = np.zeros(0, dtype=np.complex64)
+            else:
+                dph_src = p[1:] * np.conj(p[:-1])
+        if dph_src.size:
+            m = np.abs(dph_src)
+            med_m = float(np.median(m))
+            if med_m > 1e-12:
+                keep = m > (0.30 * med_m)
+                if np.count_nonzero(keep) >= 16:
+                    dph_src = dph_src[keep]
+        ph_hist = self._phase_histogram_quadrants(np.angle(dph_src)) if dph_src.size else np.zeros(4, dtype=np.float32)
+
+        ecc = self._qpsk_cluster_eccentricity(p) if mode == "qpsk" else 0.0
         return {
             "lock": lock,
             "state": state,
             "evm_pct": evm,
+            "evm_rad_pct": evm_rad,
+            "evm_tan_pct": evm_tan,
+            "evm_rt_ratio": evm_rt_ratio,
+            "mer_db": mer_db,
             "lock_metric": c_metric,
             "mode": mode,
             "domain": self.constellation_domain,
             "sps": sps,
+            "sps_nom": sps_nom,
+            "sps_off_ppm": sps_off_ppm,
             "iq_imbalance": float(np.abs(self._iq_rho)),
+            "cfo_hz": cfo_hz,
+            "cfo_ppm": cfo_ppm,
+            "ted_mean": float(self._ted_mean),
+            "ted_std": float(self._ted_std),
+            "timing_corr": float(self._timing_corr_norm),
+            "timing_clips": int(self._timing_clip_events),
+            "phase_hist": [float(ph_hist[0]), float(ph_hist[1]), float(ph_hist[2]), float(ph_hist[3])],
+            "cluster_ecc": ecc,
+            "eq_on": bool(self._eq_enabled and self.modulation_profile == "tetra"),
+            "eq_err": float(self._eq_err_rms),
+            "eq_upd": float(self._eq_upd_norm),
+            "costas_active": bool(self._costas_active_last),
         }
 
     def _maybe_emit_quality(self, points: np.ndarray, fs_for_sps: Optional[float] = None):
@@ -527,6 +694,7 @@ class Receiver(QObject):
         out = np.empty_like(iq, dtype=np.complex64)
 
         mode = self.costas_mode
+
         for i, s in enumerate(iq):
             y = s * np.exp(-1j * phase)
             if mode == "bpsk":
@@ -548,6 +716,17 @@ class Receiver(QObject):
         self._costas_freq = freq
         return out
 
+    def _apply_symbol_equalizer(self, symbols: np.ndarray) -> np.ndarray:
+        """
+        Egaliseur aveugle CMA au rythme symbole pour réduire l'ISI (profil TETRA).
+        """
+        if symbols is None or symbols.size == 0:
+            return np.zeros(0, dtype=np.complex64)
+        # SAFE MODE: EQ adaptatif temporairement bypassé (instabilités observées).
+        self._eq_err_rms *= 0.98
+        self._eq_upd_norm *= 0.98
+        return self._sanitize_complex(symbols, max_abs=20.0)
+
     def _extract_symbol_samples(self, bb: np.ndarray, fs_bb: float) -> np.ndarray:
         """
         Extrait des points au rythme symbole avec:
@@ -557,16 +736,20 @@ class Receiver(QObject):
         if bb is None or bb.size < 2 or fs_bb <= 0.0 or self.symbol_rate <= 0.0:
             return np.zeros(0, dtype=np.complex64)
 
-        sps = float(fs_bb) / float(self.symbol_rate)
-        if sps < 1.0:
+        sps_nom = float(fs_bb) / float(self.symbol_rate)
+        if sps_nom < 1.0:
             return np.zeros(0, dtype=np.complex64)
+        # Asservissement lent de cadence symbole (corrige les dérives sur longues durées).
+        # Limiter strictement l'asservissement de cadence (évite les dérives lentes internes).
+        sps = float(np.clip(sps_nom + self._sps_offset, 0.995 * sps_nom, 1.005 * sps_nom))
 
         out = []
         n = int(bb.size)
 
         # Recherche grossière de phase symbole (accroche), avec hystérésis.
         phase = float(self._sym_phase % sps)
-        need_reacq = (self._timing_conf < 0.35) or (self._timing_reacq_ctr <= 0)
+        self._timing_reacq_ctr = max(0, self._timing_reacq_ctr - 1)
+        need_reacq = (self._timing_conf < 0.18) and (self._timing_reacq_ctr <= 0)
         if need_reacq and sps >= 1.2 and n >= 32:
             n_cand = int(min(32, max(8, round(sps * 4))))
             candidates = np.linspace(0.0, sps, n_cand, endpoint=False)
@@ -593,9 +776,7 @@ class Receiver(QObject):
                         best_metric = metric
                         best_phase = float(off)
             phase = 0.85 * phase + 0.15 * best_phase
-            self._timing_reacq_ctr = 60
-        else:
-            self._timing_reacq_ctr = max(0, self._timing_reacq_ctr - 1)
+            self._timing_reacq_ctr = 180
 
         ted_err = []
         while phase < (n - 1):
@@ -609,19 +790,45 @@ class Receiver(QObject):
                 y_e = self._interp_linear(bb, t_e)
                 y_l = self._interp_linear(bb, t_l)
                 e = np.real((y_l - y_e) * np.conj(y))
-                ted_err.append(float(np.clip(e, -2.0, 2.0)))
-
+                e = float(np.clip(e, -2.0, 2.0))
+                ted_err.append(e)
             phase += sps
 
         next_phase = phase - n
         if ted_err:
-            e_mean = float(np.mean(ted_err))
-            next_phase += float(np.clip(self._timing_gain * e_mean, -0.03 * sps, 0.03 * sps))
+            e_arr = np.asarray(ted_err, dtype=np.float32)
+            e_mean = float(np.mean(e_arr))
+            e_std = float(np.std(e_arr))
+            self._ted_mean = 0.90 * self._ted_mean + 0.10 * e_mean
+            self._ted_std = 0.90 * self._ted_std + 0.10 * e_std
+
+            max_corr = 0.01 * sps
+            corr = float(np.clip(self._timing_gain * e_mean, -max_corr, max_corr))
+            if abs(corr) >= 0.98 * max_corr:
+                self._timing_clip_events += 1
+            self._timing_corr_norm = 0.90 * self._timing_corr_norm + 0.10 * (corr / max(1e-9, sps))
+            next_phase += corr
+            # Boucle lente sur la cadence: persistance d'erreur timing => ajuster sps.
+            if self._timing_conf > 0.35:
+                self._sps_offset = float(
+                    np.clip(
+                        0.9995 * self._sps_offset + 0.002 * corr,
+                        -0.005 * sps_nom,
+                        0.005 * sps_nom,
+                    )
+                )
+            else:
+                self._sps_offset *= 0.9998
+        else:
+            self._ted_mean *= 0.98
+            self._ted_std *= 0.98
+            self._timing_corr_norm *= 0.98
+            self._sps_offset *= 0.9998
         self._sym_phase = next_phase
 
         if not out:
             return np.zeros(0, dtype=np.complex64)
-        arr = np.asarray(out, dtype=np.complex64)
+        arr = self._sanitize_complex(np.asarray(out, dtype=np.complex64), max_abs=20.0)
 
         # Confiance timing: cohérence différentielle locale.
         if arr.size >= 12:
@@ -630,8 +837,11 @@ class Receiver(QObject):
             pow_n = 2 if self.costas_mode == "bpsk" else 4
             conf = float(np.abs(np.mean(dn ** pow_n)))
             self._timing_conf = 0.92 * self._timing_conf + 0.08 * conf
-            if conf < 0.18:
+            if conf < 0.14:
                 self._timing_reacq_ctr = 0
+                self._sps_offset *= 0.90
+            elif conf > 0.35:
+                self._timing_reacq_ctr = max(self._timing_reacq_ctr, 24)
 
         return arr
 
@@ -639,7 +849,7 @@ class Receiver(QObject):
         if points is None or points.size == 0:
             return np.zeros(0, dtype=np.complex64)
 
-        p = points.astype(np.complex64, copy=False)
+        p = self._sanitize_complex(points, max_abs=20.0)
         if self.constellation_domain != "differential":
             return p
 
@@ -651,6 +861,7 @@ class Receiver(QObject):
             return np.zeros(0, dtype=np.complex64)
 
         d = p[1:] * np.conj(p[:-1])
+        d = self._sanitize_complex(d, max_abs=20.0)
         self._prev_const_sample = np.complex64(p[-1])
         if d.size == 0:
             return np.zeros(0, dtype=np.complex64)
@@ -667,8 +878,10 @@ class Receiver(QObject):
 
         # Normalisation globale (pas point-par-point) pour l'affichage.
         rms = float(np.sqrt(np.mean(np.abs(d) ** 2)))
-        if rms > 1e-12:
+        if np.isfinite(rms) and rms > 1e-12:
             d = d / rms
+        else:
+            return np.zeros(0, dtype=np.complex64)
         return d.astype(np.complex64, copy=False)
 
     # --------------- (Re)config DSP sous-bande ---------------
@@ -710,32 +923,51 @@ class Receiver(QObject):
                     best = (rel_err, d, k, fs_bb, target)
             return best  # (err, d, k, fs_bb, target)
 
-        err, d, k, fs_bb, target = best_d_and_k(fs, is_wide)
+        # Pré-décimation coarse pour garder le FIR principal dans une zone CPU tenable.
+        pre_decim = 1
+        if fs >= 7_000_000.0:
+            pre_decim = 4
+        elif fs >= 3_500_000.0:
+            pre_decim = 2
+        fs_stage = fs / float(pre_decim)
+
+        err, d, k, fs_bb, target = best_d_and_k(fs_stage, is_wide)
 
         if err > 0.003:
             if self.modulation_profile == "tetra":
                 target_bb = 72_000.0
             else:
                 target_bb = 192_000.0 if is_wide else 48_000.0
-            d = int(max(1, round(fs / max(1.0, target_bb))))
-            fs_bb = fs / d
+            d = int(max(1, round(fs_stage / max(1.0, target_bb))))
+            fs_bb = fs_stage / d
             k = max(1, int(round(fs_bb / 48_000.0)))
             target = target_bb if self.modulation_profile == "tetra" else (48_000.0 * k)
             err = abs(fs_bb - target) / target
 
+        self._pre_decim = int(max(1, pre_decim))
+        self._pre_residual = np.zeros(0, dtype=np.complex64)
         self._decim = d
         self._fs_bb = fs_bb  # ≈ 48k*k
 
         # 3) FIR sous-bande (anti-alias & shape)
         if self.modulation_profile == "tetra":
-            cutoff_bw = 0.85 * (0.5 * self.symbol_rate * (1.0 + self._rrc_rolloff))
+            occ = 0.5 * self.symbol_rate * (1.0 + self._rrc_rolloff)
+            cutoff_bw = min(0.48 * self._bandwidth, 1.08 * occ)
         else:
             cutoff_bw = 0.45 * self._bandwidth
         cutoff_fsbb = 0.45 * self._fs_bb * 0.95
         cutoff = max(200.0, min(cutoff_bw, cutoff_fsbb))
 
-        self._taps_cache = design_lpf_fir(cutoff, fs, num_taps=self.num_taps, window="hamming")
-        self._taps_bw, self._taps_fs = cutoff, fs
+        fir_taps = int(self.num_taps)
+        if fs >= 7_000_000.0:
+            fir_taps = min(fir_taps, 127)
+        elif fs >= 3_500_000.0:
+            fir_taps = min(fir_taps, 191)
+        if (fir_taps % 2) == 0:
+            fir_taps += 1
+
+        self._taps_cache = design_lpf_fir(cutoff, fs_stage, num_taps=fir_taps, window="hamming")
+        self._taps_bw, self._taps_fs = cutoff, fs_stage
         self._fir_zi = np.zeros(max(0, len(self._taps_cache) - 1), dtype=np.complex64)
         self._mix_phase = 0.0
         self._decim_phase = 0
@@ -753,8 +985,9 @@ class Receiver(QObject):
 
         _log_rx(
             f"{self.name}: fs={fs:.1f} Hz, BW={self._bandwidth/1e3:.1f} kHz, "
-            f"mode={'WFM' if is_wide else 'NFM'}, d={d}, k={k}, fs_bb≈{fs_bb:.1f} "
-            f"(target={target:.1f}, err={err*100:.2f}%), LPF_cut={cutoff:.1f} Hz"
+            f"mode={'WFM' if is_wide else 'NFM'}, pre_d={self._pre_decim}, d={d}, k={k}, "
+            f"fs_bb≈{fs_bb:.1f} (target={target:.1f}, err={err*100:.2f}%), "
+            f"LPF_cut={cutoff:.1f} Hz, taps={fir_taps}"
         )
 
         # 4) Notifier le démod (mode + nouveau fs d'entrée)
@@ -774,6 +1007,27 @@ class Receiver(QObject):
 
         # fin de reconfig éventuellement déclenchée par set_bandwidth()
         self._reconfig.clear()
+
+    def _apply_pre_decim_streaming(self, x: np.ndarray) -> np.ndarray:
+        p = int(max(1, self._pre_decim))
+        if x is None or x.size == 0:
+            return np.zeros(0, dtype=np.complex64)
+        if p <= 1:
+            return x.astype(np.complex64, copy=False)
+
+        if self._pre_residual is not None and self._pre_residual.size:
+            x = np.concatenate((self._pre_residual, x))
+
+        n_full = (int(x.size) // p) * p
+        if n_full <= 0:
+            self._pre_residual = x.astype(np.complex64, copy=True)
+            return np.zeros(0, dtype=np.complex64)
+
+        x_full = x[:n_full]
+        self._pre_residual = x[n_full:].astype(np.complex64, copy=True)
+
+        y = x_full.reshape(-1, p).mean(axis=1)
+        return y.astype(np.complex64, copy=False)
 
     # --------------------- Traitement ---------------------
     @pyqtSlot(np.ndarray)
@@ -805,6 +1059,11 @@ class Receiver(QObject):
             osc = np.exp(1j * phase).astype(np.complex64, copy=False)
             bb = iq_block * osc
             self._mix_phase = float((self._mix_phase + step * iq_block.size) % (2.0 * np.pi))
+
+        # 1b) pré-décimation coarse pour limiter la charge CPU aux fortes FS.
+        bb = self._apply_pre_decim_streaming(bb)
+        if bb.size < 2:
+            return
 
         # 2) filtrage sous-bande avec état FIR conservé entre blocs
         taps = self._taps_cache
@@ -838,7 +1097,12 @@ class Receiver(QObject):
                 return
 
         # 4) (optionnel) boucle de Costas
-        if self.enable_costas:
+        use_costas = bool(self.enable_costas)
+        if self.modulation_profile == "tetra" and self.constellation_domain == "differential":
+            # En affichage différentiel, Costas apporte peu et peut injecter du jitter.
+            use_costas = False
+        self._costas_active_last = use_costas
+        if use_costas:
             bb = self._apply_costas_streaming(bb)
 
         # 5) envoi vers le démod (asynchrone audio; NE PAS bloquer)
@@ -852,6 +1116,7 @@ class Receiver(QObject):
         try:
             if self.constellation_mode == "symbols":
                 points = self._extract_symbol_samples(bb, fs_bb)
+                points = self._apply_symbol_equalizer(points)
                 points = self._map_constellation_domain(points)
                 if points.size:
                     self._maybe_emit_quality(points, fs_bb)

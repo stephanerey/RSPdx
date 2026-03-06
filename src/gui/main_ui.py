@@ -58,6 +58,9 @@ class SDRGUI(QtWidgets.QMainWindow):
         self.controller.center_frequency_changed.connect(
             self.spectrumPlotWidget.update_center_frequency
         )
+        self.spectrumPlotWidget.visible_span_changed.connect(
+            self.controller.update_fft_for_view
+        )
         # NOTE: NE PAS connecter update_selected_freq_line (single cursor legacy)
         # self.controller.center_frequency_changed.connect(
         #     self.spectrumPlotWidget.update_selected_freq_line
@@ -91,6 +94,9 @@ class SDRGUI(QtWidgets.QMainWindow):
         self.spectrumPlotWidget.average = bool(self.averageCheckBox.isChecked())
         self.spectrumPlotWidget.baseline = bool(self.baselineCheckBox.isChecked())
         self.spectrumPlotWidget.persistence = bool(self.persistenceCheckBox.isChecked())
+        ds.set_compute_average_enabled(self.spectrumPlotWidget.average)
+        ds.set_compute_peak_max_enabled(self.spectrumPlotWidget.peak_hold_max)
+        ds.set_compute_peak_min_enabled(self.spectrumPlotWidget.peak_hold_min)
 
         self.spectrumPlotWidget.clear_plot()
         self.spectrumPlotWidget.clear_peak_hold_max()
@@ -410,6 +416,11 @@ class SDRGUI(QtWidgets.QMainWindow):
     def _on_controller_fs_changed(self, new_fs: float):
         # Optionnel : forcer un rafraîchissement du tracé ou de l’axe si besoin
         try:
+            self.controller.data_storage.reset()
+            self.spectrumPlotWidget.clear_plot()
+            self.spectrumPlotWidget.clear_peak_hold_max()
+            self.spectrumPlotWidget.clear_peak_hold_min()
+            self.spectrumPlotWidget.clear_average()
             self.spectrumPlotWidget.recalculate_plot(self.controller.data_storage)
         except Exception:
             pass
@@ -478,21 +489,26 @@ class SDRGUI(QtWidgets.QMainWindow):
         if getattr(self.spectrumPlotWidget.curve, "xData", None) is None:
             self.spectrumPlotWidget.update_plot(self.controller.data_storage)
         self.spectrumPlotWidget.curve.setVisible(checked)
+        if hasattr(self.spectrumPlotWidget, "curve_fill"):
+            self.spectrumPlotWidget.curve_fill.setVisible(checked and not self.spectrumPlotWidget.subtract_baseline)
 
     @QtCore.pyqtSlot(bool)
     def on_maxHold_toggled(self, checked: bool):
         self.spectrumPlotWidget.peak_hold_max = bool(checked)
+        self.controller.data_storage.set_compute_peak_max_enabled(bool(checked))
         # force un rafraîchissement de la courbe peak-hold
         self.spectrumPlotWidget.update_peak_hold_max(self.controller.data_storage, force=True)
 
     @QtCore.pyqtSlot(bool)
     def on_minHold_toggled(self, checked: bool):
         self.spectrumPlotWidget.peak_hold_min = bool(checked)
+        self.controller.data_storage.set_compute_peak_min_enabled(bool(checked))
         self.spectrumPlotWidget.update_peak_hold_min(self.controller.data_storage, force=True)
 
     @QtCore.pyqtSlot(bool)
     def on_average_toggled(self, checked: bool):
         self.spectrumPlotWidget.average = bool(checked)
+        self.controller.data_storage.set_compute_average_enabled(bool(checked))
         self.spectrumPlotWidget.update_average(self.controller.data_storage, force=True)
 
     @QtCore.pyqtSlot(bool)
@@ -541,9 +557,11 @@ class SDRGUI(QtWidgets.QMainWindow):
             pass
 
     def on_colors_clicked(self):
-        col = QtGui.QColorDialog.getColor(QtGui.QColor("yellow"), self, "Main curve color")
+        current = QtGui.QColor(self.spectrumPlotWidget.main_color)
+        col = QtGui.QColorDialog.getColor(current, self, "Main curve color")
         if col.isValid():
             # mettre à jour juste la couleur principale; à toi d'étendre aux autres via un mini-dialog si besoin
             self.spectrumPlotWidget.main_color = pg.mkColor(col)
+            self.spectrumPlotWidget.main_fill_brush = pg.mkBrush(col.red() // 3, col.green() // 3, col.blue() // 3, 120)
             self.spectrumPlotWidget.set_colors()
             self.spectrumPlotWidget.update_plot(self.controller.data_storage, force=True)

@@ -1,15 +1,16 @@
 # src/gui/plots.py
-import collections, math
+import collections, math, time
 from PyQt5 import QtCore
 from PyQt5.QtCore import pyqtSignal, QObject
 import pyqtgraph as pg
 import numpy as np
 
-pg.setConfigOptions(antialias=True)
+pg.setConfigOptions(antialias=False)
 
 class SpectrumPlotWidget(QObject):
     receiver_frequency_changed = pyqtSignal(float)
     receiver_bandwidth_changed = pyqtSignal(float)
+    visible_span_changed = pyqtSignal(float, int)
 
     def __init__(self, layout, center_freq):
         super().__init__()
@@ -18,7 +19,9 @@ class SpectrumPlotWidget(QObject):
         self.layout = layout
         self.center_freq = center_freq
         self.main_curve = True
-        self.main_color = pg.mkColor("y")
+        self.main_color = pg.mkColor(110, 235, 255)
+        self.main_fill_brush = pg.mkBrush(20, 95, 120, 120)
+        self.main_fill_level = -120.0
         self.persistence = False
         self.persistence_length = 5
         self.persistence_decay = "exponential"
@@ -27,6 +30,9 @@ class SpectrumPlotWidget(QObject):
         self.persistence_curves = None
         self.peak_hold_max = False
         self.peak_hold_max_color = pg.mkColor("r")
+        self.fft_hold_decay = True
+        self.fft_hold_speed = 0.20  # dB par frame
+        self._fft_hold_line = None
         self.peak_hold_min = False
         self.peak_hold_min_color = pg.mkColor("b")
         self.average = False
@@ -51,6 +57,21 @@ class SpectrumPlotWidget(QObject):
         self._baseline_cache_y = None
         self._last_pen_mode_subtract = None
         self._guard = False  # <-- pour éviter les boucles de signaux
+        self._last_xrange = None
+        self._normal_yrange_set = False
+        # Mode enveloppe désactivé par défaut pour garder une réponse burst rapide.
+        self.envelope_mode = False
+        self.envelope_decay_db = 20.0
+        self._envelope_line = None
+        self.max_display_bins = 8192
+        self.fill_display_bins = 4096
+        self._pending_visible_span = 0.0
+        self._pending_plot_width = 0
+        self._last_visible_span_emit = None
+        self._visible_span_timer = QtCore.QTimer(self)
+        self._visible_span_timer.setSingleShot(True)
+        self._visible_span_timer.setInterval(120)
+        self._visible_span_timer.timeout.connect(self._emit_visible_span)
 
     def create_plot(self):
         self.posLabel = self.layout.addLabel(row=0, col=0, justify="right")
@@ -59,7 +80,11 @@ class SpectrumPlotWidget(QObject):
         self.plot.setLabel("left", "Power", units="dB")
         self.plot.setLabel("bottom", "Frequency", units="Hz")
         self.plot.setLimits(xMin=0)
+        self.plot.setClipToView(True)
+        # "peak" affiche des barres min/max. "subsample" donne un tracé plus proche SDR++.
+        self.plot.setDownsampling(auto=True, mode='subsample')
         self.plot.showButtons()
+        self.plot.getViewBox().sigXRangeChanged.connect(self._on_view_xrange_changed)
 
         self.create_baseline_curve()
         self.create_persistence_curves()
@@ -75,6 +100,30 @@ class SpectrumPlotWidget(QObject):
         self.plot.addItem(self.vLine, ignoreBounds=True)
         self.plot.addItem(self.hLine, ignoreBounds=True)
         self.mouseProxy = pg.SignalProxy(self.plot.scene().sigMouseMoved, rateLimit=30, slot=self.mouse_moved)
+
+    def _on_view_xrange_changed(self, *_args):
+        try:
+            xr = self.plot.getViewBox().viewRange()[0]
+            span = abs(float(xr[1]) - float(xr[0]))
+            width_px = int(max(1, round(self.plot.getViewBox().sceneBoundingRect().width())))
+        except Exception:
+            return
+        if not np.isfinite(span) or span <= 0.0:
+            return
+        self._pending_visible_span = span
+        self._pending_plot_width = width_px
+        self._visible_span_timer.start()
+
+    def _emit_visible_span(self):
+        span = float(self._pending_visible_span)
+        width_px = int(max(1, self._pending_plot_width))
+        if not np.isfinite(span) or span <= 0.0:
+            return
+        key = (round(span, 3), width_px)
+        if self._last_visible_span_emit == key:
+            return
+        self._last_visible_span_emit = key
+        self.visible_span_changed.emit(span, width_px)
 
     # --- synchro ligne/region
     def update_region_from_line(self):
@@ -252,6 +301,10 @@ class SpectrumPlotWidget(QObject):
         data_storage.baseline = np.asarray(y_smooth, dtype=np.float32).copy()
 
     def create_main_curve(self):
+        self.curve_fill = self.plot.plot(pen=None)
+        self.curve_fill.setFillLevel(self.main_fill_level)
+        self.curve_fill.setBrush(self.main_fill_brush)
+        self.curve_fill.setZValue(880)
         self.curve = self.plot.plot(pen=self.main_color)
         self.curve.setZValue(900)
 
@@ -313,8 +366,11 @@ class SpectrumPlotWidget(QObject):
         if mode != self._last_pen_mode_subtract:
             if mode:
                 self.curve.setPen(pg.mkPen(self.subtracted_color, width=2))
+                self.curve_fill.clear()
             else:
                 self.curve.setPen(self.main_color)
+                self.curve_fill.setFillLevel(self.main_fill_level)
+                self.curve_fill.setBrush(self.main_fill_brush)
             self._last_pen_mode_subtract = mode
 
     def _current_y_with_options(self, data_storage):
@@ -354,6 +410,9 @@ class SpectrumPlotWidget(QObject):
 
     def set_colors(self):
         self.curve.setPen(self.main_color)
+        if not self.subtract_baseline:
+            self.curve_fill.setFillLevel(self.main_fill_level)
+            self.curve_fill.setBrush(self.main_fill_brush)
         self.curve_peak_hold_max.setPen(self.peak_hold_max_color)
         self.curve_peak_hold_min.setPen(self.peak_hold_min_color)
         self.curve_average.setPen(self.average_color)
@@ -373,49 +432,139 @@ class SpectrumPlotWidget(QObject):
             return
 
         y_plot = self._current_y_with_options(data_storage)
+        if self.envelope_mode and not self.subtract_baseline:
+            y_now = np.asarray(y_plot, dtype=np.float32)
+            if self._envelope_line is None or self._envelope_line.shape != y_now.shape:
+                self._envelope_line = y_now.copy()
+            else:
+                self._envelope_line = np.maximum(y_now, self._envelope_line - float(self.envelope_decay_db))
+            y_plot = self._envelope_line
+        peak_bins = self._display_peak_bins()
+        x_plot, y_peak = self._decimate_line_for_display(data_storage.x, y_plot, mode="peak", max_bins=peak_bins)
 
         # Axe Y : si subtract -> plage compacte autour des pics visibles
         if self.subtract_baseline:
             # nanmax ignore les NaN; si tout est NaN, on met une petite plage par défaut
             try:
-                y_max = float(np.nanmax(y_plot))
-                y_min = 0.0 if self.peaks_only else float(np.nanmin(y_plot))
+                y_max = float(np.nanmax(y_peak))
+                y_min = 0.0 if self.peaks_only else float(np.nanmin(y_peak))
             except ValueError:
                 y_min, y_max = 0.0, 6.0  # pas de pics visibles
             self.plot.setYRange(y_min - 1.0, y_max + 3.0)
+            self._normal_yrange_set = False
         else:
-            self.plot.setYRange(-60, 40)
+            if not self._normal_yrange_set:
+                self.plot.setYRange(-60, 40)
+                self._normal_yrange_set = True
 
-        self.plot.setXRange(data_storage.x[0], data_storage.x[-1])
+        x0 = float(data_storage.x[0])
+        x1 = float(data_storage.x[-1])
+        xr = (x0, x1)
+        if self._last_xrange != xr:
+            self.plot.setXRange(x0, x1)
+            self._last_xrange = xr
 
         if self.main_curve or force:
             # ne change le pen que si nécessaire
             if self.subtract_baseline != self._last_pen_mode_subtract:
                 if self.subtract_baseline:
                     self.curve.setPen(pg.mkPen(self.subtracted_color, width=2))
+                    self.curve_fill.clear()
                 else:
                     self.curve.setPen(self.main_color)
+                    self.curve_fill.setFillLevel(self.main_fill_level)
+                    self.curve_fill.setBrush(self.main_fill_brush)
                 self._last_pen_mode_subtract = self.subtract_baseline
 
             # IMPORTANT: connect='finite' pour que pyqtgraph ignore les NaN proprement
-            self.curve.setData(data_storage.x, y_plot, connect='finite')
+            if self.subtract_baseline:
+                self.curve_fill.clear()
+            else:
+                self.curve_fill.setData(x_plot, y_peak, connect='finite')
+            self.curve.setData(x_plot, y_peak, connect='finite')
             self.curve.setVisible(True)
+            self.curve_fill.setVisible(not self.subtract_baseline and self.main_curve)
+
+    def _decimate_line_for_display(self, x, y, mode="peak", max_bins=None):
+        x = np.asarray(x)
+        y = np.asarray(y)
+        n = int(y.size)
+        max_bins = int(max(512, self.max_display_bins if max_bins is None else max_bins))
+        if n <= max_bins:
+            return x, y
+        step = int(np.ceil(n / float(max_bins)))
+        m = int(np.ceil(n / float(step)))
+        pad = m * step - n
+        if pad > 0:
+            x_pad = np.pad(x, (0, pad), mode='edge')
+            y_pad = np.pad(y, (0, pad), mode='edge')
+        else:
+            x_pad = x
+            y_pad = y
+        x_r = x_pad.reshape(m, step)
+        y_r = y_pad.reshape(m, step)
+        with np.errstate(all='ignore'):
+            if mode == "median":
+                y_d = np.nanmedian(y_r, axis=1)
+            elif mode == "mean":
+                y_d = np.nanmean(y_r, axis=1)
+            else:
+                y_d = np.nanmax(y_r, axis=1)
+        y_d = np.where(np.isfinite(y_d), y_d, np.nan)
+        x_d = x_r[:, step // 2]
+        return x_d, y_d
+
+    def _display_peak_bins(self):
+        try:
+            vb = self.plot.getViewBox()
+            width_px = int(max(256, round(vb.sceneBoundingRect().width())))
+        except Exception:
+            width_px = 1024
+        return int(min(self.max_display_bins, max(512, width_px)))
 
     def update_peak_hold_max(self, data_storage, force=False):
         if data_storage.x is None: return
         if self.peak_hold_max or force:
-            self.curve_peak_hold_max.setData(data_storage.x, data_storage.peak_hold_max)
-            if force: self.curve_peak_hold_max.setVisible(self.peak_hold_max)
+            y_raw = getattr(data_storage, "y", None)
+            if y_raw is None:
+                if force:
+                    self.curve_peak_hold_max.clear()
+                return
+            y = np.asarray(y_raw, dtype=np.float32)
+            if y.size == 0:
+                if force:
+                    self.curve_peak_hold_max.clear()
+                return
+            if self._fft_hold_line is None or self._fft_hold_line.shape != y.shape:
+                self._fft_hold_line = y.copy()
+            else:
+                if self.fft_hold_decay:
+                    self._fft_hold_line = np.maximum(y, self._fft_hold_line - float(self.fft_hold_speed))
+                else:
+                    self._fft_hold_line = np.maximum(self._fft_hold_line, y)
+            self.curve_peak_hold_max.setData(data_storage.x, self._fft_hold_line)
+            if force:
+                self.curve_peak_hold_max.setVisible(self.peak_hold_max)
 
     def update_peak_hold_min(self, data_storage, force=False):
         if data_storage.x is None: return
         if self.peak_hold_min or force:
+            y = getattr(data_storage, "peak_hold_min", None)
+            if y is None:
+                if force:
+                    self.curve_peak_hold_min.clear()
+                return
             self.curve_peak_hold_min.setData(data_storage.x, data_storage.peak_hold_min)
             if force: self.curve_peak_hold_min.setVisible(self.peak_hold_min)
 
     def update_average(self, data_storage, force=False):
         if data_storage.x is None: return
         if self.average or force:
+            y = getattr(data_storage, "average", None)
+            if y is None:
+                if force:
+                    self.curve_average.clear()
+                return
             self.curve_average.setData(data_storage.x, data_storage.average)
             if force: self.curve_average.setVisible(self.average)
 
@@ -467,8 +616,14 @@ class SpectrumPlotWidget(QObject):
             self.vLine.setPos(mousePoint.x()); self.hLine.setPos(mousePoint.y())
 
     # clears
-    def clear_plot(self): self.curve.clear()
-    def clear_peak_hold_max(self): self.curve_peak_hold_max.clear()
+    def clear_plot(self):
+        self._envelope_line = None
+        self._last_visible_span_emit = None
+        self.curve_fill.clear()
+        self.curve.clear()
+    def clear_peak_hold_max(self):
+        self._fft_hold_line = None
+        self.curve_peak_hold_max.clear()
     def clear_peak_hold_min(self): self.curve_peak_hold_min.clear()
     def clear_average(self): self.curve_average.clear()
     def clear_baseline(self): self.curve_baseline.clear()
@@ -489,6 +644,14 @@ class WaterfallPlotWidget:
         self.histogram_layout = histogram_layout
         self.history_size = 100
         self.counter = 0
+        self.auto_levels = False
+        self.wf_min_db = -120.0
+        self.wf_max_db = -20.0
+        self._levels_alpha = 0.10
+        self._last_draw_t = 0.0
+        self._draw_min_interval_s = 1.0 / 20.0
+        self.max_bins = 32768
+        self._last_transform_key = None
         self.create_plot()
 
     def create_plot(self):
@@ -503,29 +666,69 @@ class WaterfallPlotWidget:
             self.histogram = pg.HistogramLUTItem()
             self.histogram_layout.addItem(self.histogram)
             self.histogram.gradient.loadPreset("flame")
+        self.waterfallImg = None
+
+    def _update_levels(self, line_db: np.ndarray):
+        return
 
     def update_plot(self, data_storage):
         import pyqtgraph as pg
-        self.counter += 1
-        if self.counter == 1:
+        if data_storage is None:
+            return
+        hist_src = getattr(data_storage, "waterfall_history", None)
+        x_src = getattr(data_storage, "x_wf", None)
+        if hist_src is None:
+            hist_src = data_storage.history
+            x_src = data_storage.x
+        if hist_src is None or x_src is None:
+            return
+        now_t = time.monotonic()
+        if now_t - self._last_draw_t < self._draw_min_interval_s:
+            return
+        hist = hist_src.get_recent(self.history_size)
+        if hist is None or len(hist) == 0:
+            return
+
+        self.counter = int(min(self.history_size, hist.shape[0]))
+        if self.waterfallImg is None:
             self.waterfallImg = pg.ImageItem()
             self.plot.clear()
             self.plot.addItem(self.waterfallImg)
-        self.waterfallImg.setTransform(pg.QtGui.QTransform().scale(
-            (data_storage.x[-1] - data_storage.x[0]) / (len(data_storage.history.buffer[0]) - 1), 1))
-        self.waterfallImg.setImage(data_storage.history.buffer[-self.counter:].T, autoLevels=False, autoRange=False)
-        self.waterfallImg.setPos(data_storage.x[0], -self.counter if self.counter < self.history_size else -self.history_size)
-        if self.counter == 1 and self.histogram_layout:
-            self.histogram.setImageItem(self.waterfallImg)
+            if self.histogram_layout:
+                self.histogram.setImageItem(self.waterfallImg)
 
-    def clear_plot(self): self.counter = 0
+        view = np.asarray(hist[-self.counter:], dtype=np.float32)
+        if view.shape[1] > int(self.max_bins):
+            stride = int(np.ceil(view.shape[1] / float(self.max_bins)))
+            view = view[:, ::stride]
+            x_use = np.asarray(x_src, dtype=np.float64)[::stride]
+        else:
+            x_use = np.asarray(x_src, dtype=np.float64)
+        lo = float(self.wf_min_db)
+        hi = float(self.wf_max_db)
+        rng = max(1e-3, hi - lo)
+        z = np.clip((view - lo) / rng, 0.0, 1.0).astype(np.float32, copy=False)
+
+        x0 = float(x_use[0])
+        x1 = float(x_use[-1])
+        bins = int(max(1, view.shape[1] - 1))
+        tkey = (x0, x1, bins)
+        if self._last_transform_key != tkey:
+            self.waterfallImg.setTransform(pg.QtGui.QTransform().scale((x1 - x0) / bins, 1))
+            self._last_transform_key = tkey
+        self.waterfallImg.setImage(z.T, autoLevels=False, autoRange=False, levels=(0.0, 1.0))
+        self.waterfallImg.setPos(x0, -self.counter if self.counter < self.history_size else -self.history_size)
+        self._last_draw_t = now_t
+
+    def clear_plot(self):
+        self.counter = 0
+        self.waterfallImg = None
+        self._last_transform_key = None
 
     def recalculate_plot(self, data_storage):
-        if data_storage.x is None: return
-        self.waterfallImg.setImage(data_storage.history.buffer[-self.counter:].T, autoLevels=False, autoRange=False)
-        self.waterfallImg.setPos(data_storage.x[0], -self.counter if self.counter < self.history_size else -self.history_size)
-        if hasattr(self, "histogram"):
-            self.histogram.setImageItem(self.waterfallImg)
+        if data_storage is None or data_storage.x is None:
+            return
+        self.update_plot(data_storage)
 
 class ConstellationPlotWidget:
     def __init__(self, layout):

@@ -89,6 +89,12 @@ class FMDemodulator:
 
         self._limiter = bool(limiter)
         self._gain = 1.5 if mode == FMAudioMode.NARROW else 0.35
+        self._if_limiter = True
+        self._audio_hp_enable = True
+        self._audio_hp_fc = 250.0 if mode == FMAudioMode.NARROW else 40.0
+        self._audio_hp_x1 = 0.0
+        self._audio_hp_y1 = 0.0
+        self._audio_hp_a = self._design_audio_hp(self._audio_rate, self._audio_hp_fc)
 
         # Audio sink
         self._stream: Optional[sd.OutputStream] = None
@@ -190,7 +196,36 @@ class FMDemodulator:
         self._deemph = _design_deemphasis(self._audio_rate, deemph_us * 1e-6)
         fc = 3_000.0 if mode == FMAudioMode.NARROW else 15_000.0
         self._audio_lpf = _design_one_pole_lpf(self._audio_rate, fc)
+        self._audio_hp_fc = 250.0 if mode == FMAudioMode.NARROW else 40.0
+        self._audio_hp_a = self._design_audio_hp(self._audio_rate, self._audio_hp_fc)
+        self._audio_hp_x1 = 0.0
+        self._audio_hp_y1 = 0.0
         self.begin_reconfig(mute_sec=0.15)
+
+    @staticmethod
+    def _design_audio_hp(fs: float, fc: float) -> float:
+        if fs <= 0.0 or fc <= 0.0:
+            return 0.0
+        rc = 1.0 / (2.0 * np.pi * fc)
+        dt = 1.0 / fs
+        return float(rc / (rc + dt))
+
+    def _apply_audio_hp(self, x: np.ndarray) -> np.ndarray:
+        if x is None or x.size == 0 or (not self._audio_hp_enable) or self._audio_hp_a <= 0.0:
+            return x
+        y = np.empty_like(x, dtype=np.float32)
+        a = float(self._audio_hp_a)
+        x1 = float(self._audio_hp_x1)
+        y1 = float(self._audio_hp_y1)
+        for i in range(x.size):
+            xi = float(x[i])
+            yi = a * (y1 + xi - x1)
+            y[i] = yi
+            x1 = xi
+            y1 = yi
+        self._audio_hp_x1 = x1
+        self._audio_hp_y1 = y1
+        return y
 
     # ---------- lifecycle ----------
     def start(self, output_device: Optional[int] = None) -> None:
@@ -221,6 +256,8 @@ class FMDemodulator:
         self._deemph.z = 0.0
         self._dc = 0.0
         self._prev_bb = None
+        self._audio_hp_x1 = 0.0
+        self._audio_hp_y1 = 0.0
         self._last_out = 0.0
         with self._rb_lock:
             self._rb[:] = 0.0
@@ -311,6 +348,9 @@ class FMDemodulator:
         x = bb.astype(np.complex64, copy=False)
         if self._prev_bb is not None:
             x = np.concatenate((np.asarray([self._prev_bb], dtype=np.complex64), x))
+        # Limiteur IF (inspiré des chaînes FM matures): réduit la sensibilité AM->phase.
+        if self._if_limiter:
+            x = x / (np.abs(x) + 1e-9)
         dphi = _fm_phase_discriminator(x)
         self._prev_bb = np.complex64(x[-1])
 
@@ -340,6 +380,7 @@ class FMDemodulator:
         if self._deemph_enable and self._deemph.a > 0.0:
             y = _apply_deemphasis(y, self._deemph)
         y = _apply_one_pole_lpf(y, self._audio_lpf)
+        y = self._apply_audio_hp(y)
 
         # 6) écrire dans le ring buffer (audio callback consommera à 48 kHz)
         self._rb_write(y)
@@ -373,6 +414,8 @@ class FMDemodulator:
         self._prev_bb = None
         self._deemph.z = 0.0
         self._audio_lpf.z = 0.0
+        self._audio_hp_x1 = 0.0
+        self._audio_hp_y1 = 0.0
         # NEW: on remet à zéro le resampler si présent
         if self._out_rs is not None:
             self._out_rs.reset()
