@@ -4,10 +4,11 @@
 
 
 ## Purpose
-Quality contracts: definition of done, testing, NFR, and release gates.
+Quality contracts: definition of done, testing, validation coverage, NFR, and release gates.
 
 ## What goes here
-- DoD
-- Test strategy
+- Definition of done
+- Test strategy and commands
+- Validation matrix
 - Non-functional requirements
 - Quality gate checklist

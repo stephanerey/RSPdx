@@ -4,18 +4,19 @@
 
 
 ## Purpose
-Feature and API specifications.
+Feature, API, and interface specifications.
 
 ## What goes here
-- Feature templates and guidelines (stable)
-- Project-specific feature specs (one per feature, with IDs)
-- API specs (request/response examples, error codes)
+- Stable templates and guidelines
+- Project-specific feature specs
+- API specs for HTTP/RPC/service surfaces
+- Interface contracts for non-HTTP integration points
 
 ## Recommended structure for project-specific specs
 ```text
 30_feature/
   F001_<short_name>.md
   F002_<short_name>.md
-  api/
-    API001_<service>.md
+  API001_<service>.md
+  IFC001_<area>.md
 ```

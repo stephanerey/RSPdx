@@ -3,17 +3,43 @@
 > **PRD Policy:** **PROJECT (editable)** — Fill and update this file for the current project.
 
 
-## Performance
-- <latency, throughput, resource usage>
+**Last updated:** 2026-03-07
 
-## Reliability
-- <error rates, retries, timeouts>
+## Performance budgets
+- Startup time:
+- Steady-state latency:
+- Throughput:
+- CPU budget:
+- Memory budget:
+- Disk / network budget:
 
-## Security & privacy
-- <data handling requirements>
+## Reliability and recovery
+- Expected uptime / session stability:
+- Timeouts:
+- Retry policy:
+- Recovery behavior after failure:
+- Data-loss tolerance:
+
+## Security and privacy
+- Secret handling:
+- Sensitive data rules:
+- Authentication / authorization expectations:
+- Auditability needs:
 
 ## Observability
-- Logging, metrics, tracing (as applicable)
+- Required logs:
+- Required metrics:
+- Required traces / correlation IDs:
+- Crash diagnostics:
 
-## Compatibility
-- Supported OS/browsers/versions
+## Compatibility and portability
+- Supported OS / runtimes:
+- Supported dependency versions:
+- Backward compatibility constraints:
+- Upgrade / migration constraints:
+
+## Maintainability
+- Code health constraints:
+- Modularity expectations:
+- Documentation expectations:
+- Maximum tolerated complexity hotspots:

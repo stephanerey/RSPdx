@@ -11,13 +11,21 @@
 ## Goal
 <...>
 
+## Requirement refs
+- `REQ-###`
+
 ## Endpoint
 - Method: <GET/POST/...>
 - Path: `/...`
 - Auth: <none/bearer/session/etc.>
+- Versioning: <...>
+- Idempotency: <...>
 
 ## Request
 ### Headers
+- <...>
+
+### Parameters
 - <...>
 
 ### Body (example)
@@ -28,7 +36,7 @@
 ```
 
 ## Response
-### 200 OK (example)
+### Success example
 ```json
 {
   "result": "ok"
@@ -36,17 +44,30 @@
 ```
 
 ## Error responses
-- 400: <...>
-- 401: <...>
-- 403: <...>
-- 404: <...>
-- 500: <...>
+- `400`: <...>
+- `401`: <...>
+- `403`: <...>
+- `404`: <...>
+- `409`: <...>
+- `422`: <...>
+- `500`: <...>
 
 ## Constraints
-- <rate limits, timeouts, payload sizes>
+- Rate limits:
+- Timeouts:
+- Payload size:
+- Ordering / retry behavior:
+
+## Observability
+- Logs:
+- Metrics:
+- Trace / request ID:
 
 ## Acceptance criteria
 - <...>
 
 ## Testing notes
-- <curl examples, contract tests>
+- Contract tests:
+- Integration tests:
+- Example calls:
+- Validation refs: `VAL-###`

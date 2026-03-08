@@ -14,8 +14,22 @@
 ## Non-goals
 <...>
 
+## Requirement refs
+- `REQ-###`
+
+## Architecture refs
+- `10_architecture/...`
+
+## Dependencies
+- Internal:
+- External:
+
+## Impacted modules
+- <module or package>
+
 ## Scenarios
 1. <...>
+2. <...>
 
 ## Interfaces
 ### Inputs
@@ -30,11 +44,25 @@
 ## Constraints
 - <...>
 
+## Observability
+- Logs:
+- Metrics:
+- Debug artifacts:
+
+## Failure and rollback / fallback
+- Failure mode:
+- User-visible behavior:
+- Recovery / rollback:
+
+## Open questions
+- <...>
+
 ## Acceptance criteria
-- AC1: <...>
-- AC2: <...>
+- `AC1`: <...>
+- `AC2`: <...>
 
 ## Testing notes
 - Unit tests:
 - Integration tests:
 - Manual verification:
+- Validation refs: `VAL-###`

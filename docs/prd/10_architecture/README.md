@@ -7,12 +7,17 @@
 Define the system architecture and stable technical contracts.
 
 ## What goes here
-- High-level overview and major flows
-- Runtime/environment/deployment
-- Project/package layout and module boundaries
+- High-level overview and main flows
+- Runtime, environments, deployment
+- Project layout and module boundaries
 - Data paths and schema/storage
-- Logging, errors, security (if applicable)
+- Configuration strategy
+- External dependencies
+- Release/versioning policy
+- Logging, errors, security
+- Architecture decisions (ADRs)
 
 ## What does NOT go here
-- Feature specs (go to `30_feature/`)
-- Raw source documents (go to `95_sources/`)
+- Feature specs
+- Raw source documents
+- Product-only decisions

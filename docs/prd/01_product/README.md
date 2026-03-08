@@ -4,16 +4,21 @@
 
 
 ## Purpose
-Living product-level truth: why we build, what success means, and what we will (not) do.
+Living product-level truth: why we build, what success means, what we will (not) do, and what remains unresolved.
 
 ## What goes here
 - Product brief, scope, personas
 - KPIs and measurement approach
-- Risks, assumptions, open product questions
-- Roadmap and phases
-- Decisions log (ADR-light)
+- Risks and assumptions
+- Open questions
+- Roadmap and milestones
+- Product decisions log
 
 ## What does NOT go here
-- Raw research/docs (go to `95_sources/`)
-- Detailed module-level architecture (go to `10_architecture/`)
-- Feature implementation details (go to `30_feature/`)
+- Raw research/docs
+- Detailed architecture decisions
+- Feature implementation details
+
+## Separation of decisions
+- Product decisions go to `01_product/decisions.md`.
+- Architecture decisions go to `10_architecture/adr/`.

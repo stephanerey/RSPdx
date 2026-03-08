@@ -7,14 +7,15 @@
 Stable, cross-project rules that MUST remain consistent across projects.
 
 ## What goes here
-- Naming & conventions
+- Naming and conventions
 - PRD structure rules, IDs, traceability
-- Task tracking policy (how phases/snapshots work)
+- Task tracking policy
+- Template edit policy (referenced)
 
 ## What does NOT go here
 - Project-specific architecture decisions
 - Feature specs
-- Source documents (go to `95_sources/`)
+- Raw source documents
 
 ## Update policy
-Changes should be rare and intentional. If you update conventions, propagate to all projects (template sync).
+Changes SHOULD be rare and intentional. If you update conventions, propagate them to all projects from the template source.

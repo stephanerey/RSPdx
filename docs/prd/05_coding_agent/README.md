@@ -4,15 +4,16 @@
 
 
 ## Purpose
-Everything needed to run a coding agent (Codex or any other):
-- base prompt (stable)
-- phase prompts (scoped work)
+Everything needed to run a coding agent:
+- base prompt
+- phase prompts
 - handoff templates
 - execution plan template
 - reusable snippets
 
 ## Typical usage
-1) Ensure PRD baseline is filled (`PRD.md`, `00_conventions/*`, `01_product/*`).
-2) Pick a phase prompt from `phases/` (or create one from `templates/`).
-3) Provide the agent: base prompt + the phase prompt + relevant PRD links.
-4) Maintain progress in `02_tasks/tasks_now.md`.
+1. Ensure the PRD baseline is filled.
+2. Confirm the edit policy in `TEMPLATE_EDIT_POLICY.md`.
+3. Confirm the current phase.
+4. Give the agent: base prompt + phase prompt + relevant PRD refs.
+5. Keep `02_tasks/tasks_now.md`, `03_traceability/requirements_traceability_matrix.md`, and `90_quality/validation_matrix.md` aligned.

@@ -4,7 +4,9 @@
 
 
 Before merging:
-- [ ] Specs referenced (PRD docs)
+- [ ] Specs referenced
+- [ ] Traceability updated
+- [ ] Validation row exists or is updated
 - [ ] Tests pass
 - [ ] Verification steps documented
 - [ ] No new unapproved dependencies
