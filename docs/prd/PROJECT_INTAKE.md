@@ -13,27 +13,29 @@
 - provide a flexible, performant and useful interface to receive and demodulate Rf signals
 
 ### Target outcome
-- 
+- fournir une application fonctionnelle, performante et stable capable de recevoir facilement des extensions. L’architecture doit être modulaire afin de faciliter l’ajout de nouvelles fonctionnalités.
 
 ### Why now
-- 
+- aucune contrainte externe spécifique ; le refactoring est engagé pour améliorer la codebase existante et préparer l’ajout de nouvelles fonctionnalités.
 
 ## Users and usage context
 - Primary users: hamradio
-- Secondary users: 
+- Secondary users:
+  - chercheurs, scientifiques ou personnes simplement curieuses
 
 ### Operational context
-- 
+- utilisation sur PC fixe ou ordinateur portable sans contrainte environnementale particulière
 
 ### Main usage scenarios
 - the software will be launched and connected to the RSPdx. It will enable to receive spectrum and waterfall to see signals. Then there will be demodulations options for demodulate audio and digital signals. Provision for a crypto part to decrypt encrypted signal might be provided. The application is supposed to be tactical meaning enabling to quickly jump on a signal and demodulate it
 
 ## Scope
 ### In scope
-- 
+- première version après refactoring : fournir une version stable avec une structure modulaire retravaillée. Le multithreading sera revu en réutilisant le code du projet Antrack. L’interface utilisateur actuelle sera conservée.
+- ajout de nouveaux modes de démodulation audio : AM, USB, LSB et CW.
 
 ### Out of scope
-- 
+- refonte de l’interface utilisateur et fonctionnalités non spécifiées ci‑dessus
 
 ## Project type and lifecycle
 - Type: python_tool
@@ -56,17 +58,17 @@
 - the performance must not be limited by the UI fornt end. Everything must be thought in a seek for highest performance
 
 ### Security / privacy constraints
-- 
+- aucune contrainte particulière identifiée
 
 ### Regulatory / safety constraints
-- 
+- aucune contrainte particulière identifiée
 
 ### Budget / team / maintenance constraints
-- 
+- à préciser
 
 ## Interfaces and dependencies
 ### External APIs / services
-- The connection to the RSPdx can be done either with the SDRplay API or using library like SOAPY. An existing project is already running using SOAPY and code will be delivered later on but if using an other library seems a better choice this is open for discussino
+- Le SDR pourra être piloté via l’API officielle SDRPlay ou via une bibliothèque alternative telle que SoapySDR. Un projet existant utilisant Soapy sera fourni, et il conviendra d’évaluer laquelle de ces deux librairies offre les meilleures performances.
 
 ### Hardware / fieldbus / devices
 - SDRplay RSPdx connected on USB
@@ -85,10 +87,10 @@
 
 ## Unknowns and risks
 ### Main unknowns
-- 
+- identifier la librairie d’interface SDR (SDRPlay API vs SoapySDR) la plus performante
 
 ### Main risks
-- 
+- aucun incident ni risque majeur identifié à ce stade
 
 ### Open questions to resolve before implementation
 - 
@@ -98,7 +100,9 @@
 - 
 
 ### Reference documents
-- 
+- [Documentation API SDRPlay](https://www.sdrplay.com/api/)
+- [Bibliothèque SoapySDR](https://github.com/pothosware/SoapySDR)
+- [Logiciel SDR++ (SDRPlusPlus)](https://github.com/AlexandreRouma/SDRPlusPlus) – ce logiciel servira de modèle pour certains aspects
 
 ### Related repositories
 -
