@@ -13,9 +13,7 @@ class ReceiversManager(QObject):
         self._rx[rx.name] = rx
 
     def remove(self, name: str):
-        rx = self._rx.pop(name, None)
-        if rx is not None:
-            rx.deleteLater()
+        self._rx.pop(name, None)
 
     def get(self, name: str) -> Receiver:
         return self._rx.get(name)

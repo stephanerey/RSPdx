@@ -1,5 +1,8 @@
 from __future__ import annotations
-import threading, datetime, time
+import datetime
+import logging
+import threading
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional, Tuple
@@ -11,12 +14,13 @@ from src.core.dsp.resampler import RationalResampler
 
 # ---------- logs ----------
 DEBUG_FM = False
+LOGGER = logging.getLogger("RSPdx.FMDemodulator")
 
 def _log_fm(*args):
     if not DEBUG_FM: return
     ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
     th = threading.current_thread().name
-    print(f"[FM][{ts}][{th}]", *args)
+    LOGGER.debug("[FM][%s][%s] %s", ts, th, " ".join(str(arg) for arg in args))
 
 class FMAudioMode(Enum):
     NARROW = "nfm"
@@ -110,8 +114,18 @@ class FMDemodulator:
         self._mute_until = 0.0
         self._prefill_needed = False
         self._prefill_target = int(self._audio_rate * 0.20)  # 200 ms
+        self._recovery_threshold_pct = 10.0
         self._fade_in_remaining = 0
         self._last_out = 0.0  # pour underrun
+        self._last_audio_rms = 0.0
+        self._last_audio_peak = 0.0
+        self._audio_clip_events = 0
+        self._audio_clip_samples = 0
+        self._audio_underrun_events = 0
+        self._audio_underrun_frames = 0
+        self._audio_overflow_events = 0
+        self._audio_overflow_samples = 0
+        self._audio_buffer_low_water_pct = 100.0
 
         # ring buffer (producteur: process_block, consommateur: callback)
         self._rb_size = int(self._audio_rate * 0.6)  # 600 ms
@@ -150,6 +164,10 @@ class FMDemodulator:
         x = x.astype(np.float32, copy=False)
         with self._rb_lock:
             space = self._rb_space(); n = min(space, x.size)
+            dropped = int(x.size - n)
+            if dropped > 0:
+                self._audio_overflow_events += 1
+                self._audio_overflow_samples += dropped
             if n <= 0: return
             n1 = min(n, self._rb_size - self._rb_w)
             self._rb[self._rb_w:self._rb_w+n1] = x[:n1]
@@ -158,11 +176,15 @@ class FMDemodulator:
             if n2>0:
                 self._rb[0:n2] = x[n1:n1+n2]
                 self._rb_w = (self._rb_w + n2) % self._rb_size
+            fill_pct = 100.0 * self._rb_available() / max(1, self._rb_size)
+            self._audio_buffer_low_water_pct = min(self._audio_buffer_low_water_pct, fill_pct)
 
     def _rb_read(self, n: int) -> np.ndarray:
         out = np.zeros(n, dtype=np.float32)
         with self._rb_lock:
             avail = self._rb_available(); m = min(avail, n)
+            if m <= 0:
+                self._audio_buffer_low_water_pct = min(self._audio_buffer_low_water_pct, 0.0)
             if m>0:
                 n1 = min(m, self._rb_size - self._rb_r)
                 out[:n1] = self._rb[self._rb_r:self._rb_r+n1]
@@ -171,6 +193,8 @@ class FMDemodulator:
                 if n2>0:
                     out[n1:n1+n2] = self._rb[0:n2]
                     self._rb_r = (self._rb_r + n2) % self._rb_size
+                fill_pct = 100.0 * self._rb_available() / max(1, self._rb_size)
+                self._audio_buffer_low_water_pct = min(self._audio_buffer_low_water_pct, fill_pct)
         return out
 
     # ---------- dynamic params ----------
@@ -237,7 +261,10 @@ class FMDemodulator:
             try: dev_used = sd.default.device[1]
             except Exception: dev_used = None
 
-        print("[FM] opening audio:", dev_used, self.device_name(dev_used) if dev_used is not None else "(default)")
+        LOGGER.info(
+            "Opening FM audio on %s",
+            self.device_name(dev_used) if dev_used is not None else "(default)",
+        )
         _log_fm(f"START: audio_rate={self._audio_rate} Hz, in_rate(now)={self._in_rate} Hz, device={dev_used}")
 
         self._stream = sd.OutputStream(
@@ -262,9 +289,11 @@ class FMDemodulator:
         with self._rb_lock:
             self._rb[:] = 0.0
             self._rb_w = self._rb_r = 0
+            self._audio_buffer_low_water_pct = 100.0
 
         # NEW: (re)crée le resampler de sortie
         self._out_rs = RationalResampler(self._in_rate, self._audio_rate)
+        self.reset_runtime_stats(reset_buffer_metrics=False)
 
         self._running = True
         _log_fm("Audio callback started.")
@@ -300,11 +329,20 @@ class FMDemodulator:
         if status:
             _log_fm(f"callback status: {status}")
         now = time.monotonic()
+        if (not self._prefill_needed) and self._rb_size > 0:
+            fill_pct = 100.0 * self._rb_available() / max(1, self._rb_size)
+            if fill_pct < self._recovery_threshold_pct:
+                self._prefill_needed = True
+                self._mute_until = max(self._mute_until, now + 0.05)
         if self._prefill_needed or now < self._mute_until:
             outdata.fill(0.0); return
 
         y = self._rb_read(frames)
         if y.size < frames:
+            self._audio_underrun_events += 1
+            self._audio_underrun_frames += int(frames - y.size)
+            self._prefill_needed = True
+            self._mute_until = max(self._mute_until, now + 0.05)
             fill_n = frames - y.size
             if y.size == 0:
                 out = np.full(frames, self._last_out, dtype=np.float32)
@@ -333,6 +371,7 @@ class FMDemodulator:
         self._stream = None
         self._out_rs = None
         self._prev_bb = None
+        self.reset_runtime_stats()
         _log_fm("STOP done (stream closed).")
 
     # ---------- processing ----------
@@ -382,6 +421,19 @@ class FMDemodulator:
         y = _apply_one_pole_lpf(y, self._audio_lpf)
         y = self._apply_audio_hp(y)
 
+        clip_count = int(np.count_nonzero(np.abs(y) > 1.0))
+        if clip_count:
+            self._audio_clip_events += 1
+            self._audio_clip_samples += clip_count
+        y = np.clip(y, -1.0, 1.0).astype(np.float32, copy=False)
+
+        if y.size:
+            self._last_audio_rms = float(np.sqrt(np.mean(y * y)))
+            self._last_audio_peak = float(np.max(np.abs(y)))
+        else:
+            self._last_audio_rms = 0.0
+            self._last_audio_peak = 0.0
+
         # 6) écrire dans le ring buffer (audio callback consommera à 48 kHz)
         self._rb_write(y)
 
@@ -400,6 +452,34 @@ class FMDemodulator:
                 self._fade_in_remaining = int(0.02 * self._audio_rate)  # 20 ms
                 self._mute_until = 0.0
                 _log_fm(f"prefill reached ({avail} >= {self._prefill_target}) — unmute + fade-in")
+
+    def get_runtime_stats(self) -> dict:
+        return {
+            "audio_rate_hz": float(self._audio_rate),
+            "audio_running": bool(self._running),
+            "audio_buffer_fill_pct": 100.0 * self._rb_available() / max(1, self._rb_size),
+            "audio_low_water_pct": float(self._audio_buffer_low_water_pct),
+            "audio_rms": float(self._last_audio_rms),
+            "audio_peak": float(self._last_audio_peak),
+            "audio_underruns": int(self._audio_underrun_events),
+            "audio_underrun_frames": int(self._audio_underrun_frames),
+            "audio_overflows": int(self._audio_overflow_events),
+            "audio_overflow_samples": int(self._audio_overflow_samples),
+            "audio_clip_events": int(self._audio_clip_events),
+            "audio_clip_samples": int(self._audio_clip_samples),
+        }
+
+    def reset_runtime_stats(self, reset_buffer_metrics: bool = True) -> None:
+        self._last_audio_rms = 0.0
+        self._last_audio_peak = 0.0
+        self._audio_clip_events = 0
+        self._audio_clip_samples = 0
+        self._audio_underrun_events = 0
+        self._audio_underrun_frames = 0
+        self._audio_overflow_events = 0
+        self._audio_overflow_samples = 0
+        if reset_buffer_metrics:
+            self._audio_buffer_low_water_pct = 100.0
 
     # ---------- reconfig ----------
     def begin_reconfig(self, mute_sec: float = 0.25):
@@ -422,4 +502,5 @@ class FMDemodulator:
         # on vide proprement (on lit = on met r=w) pour repartir sans vieux samples
         with self._rb_lock:
             self._rb_r = self._rb_w
+            self._audio_buffer_low_water_pct = 100.0
         _log_fm(f"BEGIN_RECONFIG: mute ~{mute_sec*1000:.0f} ms, prefill target {self._prefill_target} samples")

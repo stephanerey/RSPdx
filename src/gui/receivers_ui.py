@@ -50,6 +50,8 @@ class ReceiversUI(QtCore.QObject):
         page = self.tab.widget(index)
         rx = self._pages.pop(page, None)
         self.tab.removeTab(index)
+        if page is not None:
+            page.deleteLater()
         if rx is not None:
             self.closed.emit(rx)
 

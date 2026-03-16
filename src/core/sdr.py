@@ -1,13 +1,25 @@
-import time
+import logging
 import threading
+import time
+
 import numpy as np
 import SoapySDR
-from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CF32
 from PyQt5 import QtCore
 from PyQt5.QtCore import QObject, pyqtSignal
-from scipy.signal import lfilter
+from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_RX
+
+from src.config.settings import (
+    DEFAULT_BUFF_SIZE,
+    DEFAULT_CENTER_FREQ,
+    DEFAULT_FFT_FPS,
+    DEFAULT_IF_GAIN,
+    DEFAULT_PERF_LOG_INTERVAL_S,
+    DEFAULT_RF_GAIN,
+    DEFAULT_SAMPLE_RATE,
+    MAX_HISTORY_SIZE,
+)
 from src.core.data_storage import DataStorage
-from src.config.settings import DEFAULT_SAMPLE_RATE, DEFAULT_CENTER_FREQ, DEFAULT_BUFF_SIZE
+from src.core.dsp import apply_ema, blackman_window, compute_power_spectrum_db, fft_max_for_sample_rate, frequency_axis, select_fft_size
 
 
 class SDRController(QObject):
@@ -17,21 +29,28 @@ class SDRController(QObject):
     center_frequency_changed = QtCore.pyqtSignal(float)
     sample_rate_about_to_change = QtCore.pyqtSignal(float)  # nouveau FS
     sample_rate_changed = QtCore.pyqtSignal(float)
+    perf_updated = QtCore.pyqtSignal(dict)
 
-    def __init__(self,
-                 sample_rate=DEFAULT_SAMPLE_RATE,
-                 center_freq=DEFAULT_CENTER_FREQ,
-                 buff_size=DEFAULT_BUFF_SIZE):
+    def __init__(
+        self,
+        sample_rate=DEFAULT_SAMPLE_RATE,
+        center_freq=DEFAULT_CENTER_FREQ,
+        buff_size=DEFAULT_BUFF_SIZE,
+        thread_manager=None,
+    ):
         super().__init__()
+        self.logger = logging.getLogger("RSPdx.SDRController")
 
         # État
+        self.thread_manager = thread_manager
         self.running = False
+        self._thread_name = "sdr_controller"
         self.thread = None
         self.stream = None
         self._last_stream_error_log = 0.0
         self._timeout_code = int(getattr(SoapySDR, "SOAPY_SDR_TIMEOUT", -1))
         self._last_plot_push = 0.0
-        self._plot_interval_s = 1.0 / 20.0  # proche du profil visuel SDR++
+        self._plot_interval_s = 1.0 / float(DEFAULT_FFT_FPS)
         self._fft_db_ema = None
         self._fft_ema_alpha = 1.0
         self._fft_win = None
@@ -39,27 +58,36 @@ class SDRController(QObject):
         self._fft_win_power = 1.0
         self._freq_axis = None
         self._freq_axis_key = None
+        self._perf_log_interval_s = float(DEFAULT_PERF_LOG_INTERVAL_S)
+        self._perf_window_started_at = time.monotonic()
+        self._perf_last_log_at = self._perf_window_started_at
+        self._perf_blocks = 0
+        self._perf_samples = 0
+        self._perf_fft_updates = 0
+        self._perf_fft_time_s = 0.0
+        self._perf_timeouts = 0
+        self._perf_stream_errors = 0
 
         # Réglages
         self.sample_rate = float(sample_rate)
         self.center_freq = float(center_freq)
         self.buff_size   = int(buff_size)
         # FFT d'affichage: taille adaptative pour meilleure résolution fréquentielle.
-        self.fft_size    = self._select_fft_size(self.sample_rate, self.buff_size)
+        self.fft_size = select_fft_size(self.sample_rate, self.buff_size)
 
         # Matériel / infos
         self.sdr = None
         self.hwinfo = {}
 
         # Data storage (spectre, etc.)
-        self.data_storage = DataStorage(max_history_size=100)
+        self.data_storage = DataStorage(max_history_size=MAX_HISTORY_SIZE)
 
         # Découverte et ouverture SDR (robuste)
         self._init_device()
 
         # Gains par défaut
-        self.if_gain = 40
-        self.rf_gain = 15
+        self.if_gain = DEFAULT_IF_GAIN
+        self.rf_gain = DEFAULT_RF_GAIN
         self.agc     = False
 
         # Appliquer la config si HW présent
@@ -85,7 +113,7 @@ class SDRController(QObject):
             devices = SoapySDR.Device_enumerate()
         except Exception as e:
             devices = []
-            print(f"[WARN] Soapy enumerate failed: {e}")
+            self.logger.warning("Soapy enumerate failed: %s", e)
         # Essais d'énumération ciblés SDRplay si l'énumération globale est vide.
         if not devices:
             for args in (dict(driver="sdrplay"), dict(driver="sdrplay_api")):
@@ -145,16 +173,16 @@ class SDRController(QObject):
 
         self.sdr = opened
         if self.sdr is None:
-            print("[WARN] No SDRPlay device opened — running in dummy mode.")
+            self.logger.warning("No SDRPlay device opened; running in dummy mode.")
             if open_errs:
-                print("[WARN] SDRPlay open attempts:")
+                self.logger.warning("SDRPlay open attempts:")
                 for msg in open_errs[:8]:
-                    print("  -", msg)
+                    self.logger.warning("  - %s", msg)
             mods = [m.lower() for m in self.hwinfo.get("modules", [])]
             if mods and (not any("sdrplay" in m for m in mods)):
-                print("[WARN] Soapy module list does not contain SDRplay. Installed modules:")
+                self.logger.warning("Soapy module list does not contain SDRplay. Installed modules:")
                 for m in self.hwinfo.get("modules", [])[:20]:
-                    print("  -", m)
+                    self.logger.warning("  - %s", m)
 
         if self.sdr is not None:
             # Infos réelles
@@ -177,38 +205,13 @@ class SDRController(QObject):
             self.hwinfo['gainRange']   = None
             self.hwinfo['sampleRates'] = [self.sample_rate]
 
-    @staticmethod
-    def _select_fft_size(fs_hz: float, buff_size: int) -> int:
-        """
-        Choix adaptatif de la FFT d'affichage.
-        Vise une RBW ~80 Hz tout en restant borné pour préserver la fluidité.
-        """
-        fs = float(max(1.0, fs_hz))
-        bsz = int(max(1024, buff_size))
-        target_rbw_hz = 40.0 if fs <= 4_000_000.0 else 180.0
-        max_fft = 65536 if fs <= 4_000_000.0 else 32768
-        n_target = int(2 ** np.ceil(np.log2(fs / target_rbw_hz)))
-        n_target = max(2048, n_target)
-        n_target = min(bsz, n_target)
-        n_target = min(max_fft, n_target)
-        # sécurité puissance de 2
-        n_pow2 = int(2 ** int(np.floor(np.log2(max(2, n_target)))))
-        return int(max(1024, n_pow2))
-
-    @staticmethod
-    def _fft_max_for_fs(fs_hz: float, buff_size: int) -> int:
-        fs = float(max(1.0, fs_hz))
-        bsz = int(max(1024, buff_size))
-        max_fft = 65536 if fs <= 4_000_000.0 else 32768
-        return int(min(bsz, max_fft))
-
     def update_fft_for_view(self, visible_span_hz: float, pixel_width: int):
         fs = float(max(1.0, self.sample_rate))
         span = float(max(1.0, min(abs(visible_span_hz), fs)))
         width_px = int(max(128, pixel_width))
 
-        base_fft = self._select_fft_size(fs, self.buff_size)
-        max_fft = self._fft_max_for_fs(fs, self.buff_size)
+        base_fft = select_fft_size(fs, self.buff_size)
+        max_fft = fft_max_for_sample_rate(fs, self.buff_size)
 
         # Sur-échantillonnage d'affichage: plusieurs bins FFT pour un pixel visible.
         zoom_target = fs * float(width_px) * 6.0 / span
@@ -231,17 +234,32 @@ class SDRController(QObject):
         if self.running:
             return
         self.running = True
+        self._reset_perf_counters()
         self.thread = threading.Thread(target=self.run, daemon=True, name="SDR-Thread")
         self.thread.start()
+        if self.thread_manager is not None:
+            self.thread_manager.register_external_thread(self._thread_name, self.thread)
 
     def stop(self):
         self.running = False
+        if self.sdr is not None and self.stream is not None:
+            try:
+                self.sdr.deactivateStream(self.stream)
+            except Exception:
+                pass
+            try:
+                self.sdr.closeStream(self.stream)
+            except Exception:
+                pass
+            self.stream = None
         if self.thread and self.thread.is_alive():
             if threading.current_thread() is not self.thread:
                 try:
-                    self.thread.join()
+                    self.thread.join(timeout=2.0)
                 except RuntimeError:
                     pass
+        if self.thread_manager is not None:
+            self.thread_manager.unregister_external_thread(self._thread_name)
         self.thread = None
 
     # ---- Boucle d’acquisition ----
@@ -261,18 +279,23 @@ class SDRController(QObject):
                     buffer = (0.5*tone1 + 0.3*tone2 + noise).astype(np.complex64)
 
                     self.iq_block.emit(buffer.copy())
+                    self._record_perf_block(buffer.size)
                     now = time.monotonic()
                     if now - self._last_plot_push >= self._plot_interval_s:
                         try:
+                            fft_t0 = time.monotonic()
                             power = self.compute_spectrum(buffer)
+                            self._perf_fft_time_s += max(0.0, time.monotonic() - fft_t0)
+                            self._perf_fft_updates += 1
                             freqs = self._get_freq_axis(len(power), fs)
                             self.data_storage.update({"timestamp": t, "x": freqs, "y": power})
                         except Exception as e:
                             now_err = time.monotonic()
                             if now_err - self._last_stream_error_log >= 1.0:
-                                print(f"[SDR] spectrum compute error (dummy): {e}")
+                                self.logger.warning("Spectrum compute error (dummy): %s", e)
                                 self._last_stream_error_log = now_err
                         self._last_plot_push = now
+                    self._maybe_log_perf(now, mode="dummy")
 
                     t += 1
                     time.sleep(0.01)
@@ -289,7 +312,7 @@ class SDRController(QObject):
                 self.stream = self.sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
             # IMPORTANT: flags=0 pour lever toute ambiguïté d’overload
             self.sdr.activateStream(self.stream, 0)
-            print(f"[SDR] HW stream activate: fs={self.sample_rate}, fc={self.center_freq}")
+            self.logger.info("Hardware stream activated: fs=%s, fc=%s", self.sample_rate, self.center_freq)
 
             buffer = np.zeros(self.buff_size, dtype=np.complex64)
             while self.running:
@@ -298,31 +321,38 @@ class SDRController(QObject):
                     n_read = int(sr.ret)
                     iq = buffer[:n_read].copy()
                     self.iq_block.emit(iq)
+                    self._record_perf_block(n_read)
                     now = time.monotonic()
                     if now - self._last_plot_push >= self._plot_interval_s:
                         try:
+                            fft_t0 = time.monotonic()
                             power = self.compute_spectrum(iq)
+                            self._perf_fft_time_s += max(0.0, time.monotonic() - fft_t0)
+                            self._perf_fft_updates += 1
                             fs = float(self.sample_rate)
                             freqs = self._get_freq_axis(len(power), fs)
                             self.data_storage.update({"timestamp": now, "x": freqs, "y": power})
                         except Exception as e:
                             now_err = time.monotonic()
                             if now_err - self._last_stream_error_log >= 1.0:
-                                print(f"[SDR] spectrum compute error (hw): {e}")
+                                self.logger.warning("Spectrum compute error (hardware): %s", e)
                                 self._last_stream_error_log = now_err
                         self._last_plot_push = now
+                    self._maybe_log_perf(now, mode="hardware")
                 elif sr.ret == self._timeout_code:
+                    self._perf_timeouts += 1
                     time.sleep(0.001)
                 elif sr.ret < 0:
+                    self._perf_stream_errors += 1
                     # Limiter les logs d'erreur stream pour éviter le spam.
                     now = time.monotonic()
                     if now - self._last_stream_error_log >= 1.0:
-                        print(f"[SDR] readStream error: ret={sr.ret}")
+                        self.logger.warning("readStream error: ret=%s", sr.ret)
                         self._last_stream_error_log = now
                     time.sleep(0.001)
 
         except Exception as e:
-            print(f"Erreur SDR : {e}")
+            self.logger.exception("SDR runtime error: %s", e)
         finally:
             # Fermeture propre du stream matériel
             if self.sdr is not None and self.stream is not None:
@@ -335,6 +365,61 @@ class SDRController(QObject):
                 except Exception:
                     pass
                 self.stream = None
+            if self.thread_manager is not None:
+                self.thread_manager.unregister_external_thread(self._thread_name)
+
+    def _reset_perf_counters(self) -> None:
+        now = time.monotonic()
+        self._perf_window_started_at = now
+        self._perf_last_log_at = now
+        self._perf_blocks = 0
+        self._perf_samples = 0
+        self._perf_fft_updates = 0
+        self._perf_fft_time_s = 0.0
+        self._perf_timeouts = 0
+        self._perf_stream_errors = 0
+
+    @QtCore.pyqtSlot()
+    def reset_perf_stats(self) -> None:
+        self._reset_perf_counters()
+
+    def _record_perf_block(self, sample_count: int) -> None:
+        self._perf_blocks += 1
+        self._perf_samples += int(sample_count)
+
+    def _maybe_log_perf(self, now: float, mode: str) -> None:
+        elapsed = now - self._perf_last_log_at
+        if elapsed < self._perf_log_interval_s:
+            return
+        sample_rate_eff = self._perf_samples / max(elapsed, 1e-9)
+        iq_mbit_s = sample_rate_eff * 64.0 / 1_000_000.0
+        block_rate = self._perf_blocks / max(elapsed, 1e-9)
+        fft_rate = self._perf_fft_updates / max(elapsed, 1e-9)
+        fft_avg_ms = 1000.0 * self._perf_fft_time_s / max(1, self._perf_fft_updates)
+        fs_target = float(max(1.0, self.sample_rate))
+        fs_ratio = 100.0 * sample_rate_eff / fs_target
+        perf_snapshot = {
+            "mode": mode,
+            "sample_rate_target_hz": fs_target,
+            "sample_rate_effective_hz": sample_rate_eff,
+            "sample_rate_ratio_pct": fs_ratio,
+            "iq_mbit_s": iq_mbit_s,
+            "block_rate_hz": block_rate,
+            "fft_rate_hz": fft_rate,
+            "fft_avg_ms": fft_avg_ms,
+            "time_outs": int(self._perf_timeouts),
+            "stream_errors": int(self._perf_stream_errors),
+            "fft_size": int(self.fft_size),
+            "buffer_size": int(self.buff_size),
+        }
+        self.perf_updated.emit(perf_snapshot)
+        self._perf_last_log_at = now
+        self._perf_blocks = 0
+        self._perf_samples = 0
+        self._perf_fft_updates = 0
+        self._perf_fft_time_s = 0.0
+        self._perf_timeouts = 0
+        self._perf_stream_errors = 0
 
     # ---- Réglages ----
     def update_if_gain(self, value):
@@ -362,7 +447,7 @@ class SDRController(QObject):
 
     def set_sample_rate(self, new_sample_rate):
         new_sample_rate = float(new_sample_rate)
-        print(f"[SDR] FS change requested: {self.sample_rate} -> {new_sample_rate}")
+        self.logger.info("Sample rate change requested: %s -> %s", self.sample_rate, new_sample_rate)
         was_running = bool(self.running)
 
         # 1) prévenir tout le monde (RX/démod) AVANT d'arrêter le flux
@@ -378,18 +463,18 @@ class SDRController(QObject):
 
         # 3) appliquer côté HW
         self.sample_rate = new_sample_rate
-        self.fft_size = self._select_fft_size(self.sample_rate, self.buff_size)
+        self.fft_size = select_fft_size(self.sample_rate, self.buff_size)
         self._freq_axis = None
         self._freq_axis_key = None
         if self.sdr is not None:
             try:
                 self.sdr.setSampleRate(SOAPY_SDR_RX, 0, self.sample_rate)
             except Exception as e:
-                print(f"[SDR] setSampleRate error: {e}")
+                self.logger.warning("setSampleRate error: %s", e)
 
         # 4) signal “FS changé” (UI/Receiver)
         self.sample_rate_changed.emit(self.sample_rate)
-        print(f"[SDR] FS applied & signal emitted: {self.sample_rate}")
+        self.logger.info("Sample rate applied and signal emitted: %s", self.sample_rate)
 
         # 5) redémarrer proprement (si l'appel ne vient pas de la boucle SDR)
         if was_running and threading.current_thread() is not self.thread:
@@ -403,25 +488,11 @@ class SDRController(QObject):
             self.sdr.setAntenna(SOAPY_SDR_RX, 0, self.antenna)
 
     # ---- Spectre ----
-    @staticmethod
-    def _blackman_window(n: int) -> np.ndarray:
-        """
-        Fenetre Blackman explicite pour rapprocher le rendu SDR++.
-        """
-        n = int(max(1, n))
-        if n == 1:
-            return np.ones(1, dtype=np.float32)
-        a0, a1, a2 = 0.42, 0.5, 0.08
-        k = np.arange(n, dtype=np.float32)
-        x = (2.0 * np.pi * k) / float(n - 1)
-        w = a0 - a1 * np.cos(x) + a2 * np.cos(2.0 * x)
-        return w.astype(np.float32, copy=False)
-
     def _ensure_fft_window(self):
         n = int(max(8, self.fft_size))
         if self._fft_win is not None and self._fft_win_size == n:
             return
-        w = self._blackman_window(n)
+        w = blackman_window(n)
         pw = float(np.sum(w * w))
         if pw <= 1e-12:
             pw = 1.0
@@ -436,8 +507,7 @@ class SDRController(QObject):
         key = (int(n_bins), float(fs), float(self.center_freq))
         if self._freq_axis is not None and self._freq_axis_key == key:
             return self._freq_axis
-        freqs = np.fft.fftshift(np.fft.fftfreq(int(n_bins), 1.0 / float(fs))).astype(np.float64)
-        freqs += float(self.center_freq)
+        freqs = frequency_axis(int(n_bins), fs, self.center_freq)
         self._freq_axis = freqs
         self._freq_axis_key = key
         return freqs
@@ -445,30 +515,6 @@ class SDRController(QObject):
     def compute_spectrum(self, iq_data):
         nfft = int(max(8, self.fft_size))
         self._ensure_fft_window()
-
-        x = np.asarray(iq_data, dtype=np.complex64)
-        if x.size < nfft:
-            x = np.pad(x, (0, nfft - x.size), mode='constant')
-        elif x.size > nfft:
-            x = x[:nfft]
-
-        # Fenêtrage simple; le centrage fréquentiel est assuré par fftshift au retour.
-        x = x * self._fft_win
-
-        fft_data = np.fft.fft(x, nfft)
-        p_lin = (np.abs(fft_data) ** 2).astype(np.float32, copy=False)
-        p_lin = p_lin / max(1.0, self._fft_win_power * float(nfft))
-        p_db = 10.0 * np.log10(p_lin + 1e-12)
-
-        # EMA stateful sur le spectre en dB (inspiré du smoothing SDR++).
-        if self._fft_db_ema is None or self._fft_db_ema.shape != p_db.shape:
-            self._fft_db_ema = p_db.copy()
-        else:
-            a = float(np.clip(self._fft_ema_alpha, 0.01, 1.0))
-            self._fft_db_ema = (1.0 - a) * self._fft_db_ema + a * p_db
-
-        return np.fft.fftshift(self._fft_db_ema).astype(np.float32, copy=False)
-
-    @staticmethod
-    def _ema_filter(data, alpha=0.2):
-        return lfilter([alpha], [1, alpha - 1], data)
+        p_db = compute_power_spectrum_db(iq_data, nfft, window=self._fft_win, window_power=self._fft_win_power)
+        self._fft_db_ema = apply_ema(p_db, self._fft_db_ema, alpha=self._fft_ema_alpha)
+        return self._fft_db_ema.astype(np.float32, copy=False)

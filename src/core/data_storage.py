@@ -1,5 +1,8 @@
+import logging
+
 from PyQt5 import QtCore
 import numpy as np
+from src.config.settings import DEFAULT_WATERFALL_MAX_BINS, DEFAULT_WATERFALL_TIME_STRIDE
 from src.utils.misc import smooth
 
 class HistoryBuffer:
@@ -60,9 +63,10 @@ class DataStorage(QtCore.QObject):
 
     def __init__(self, max_history_size=100, parent=None):
         super().__init__(parent)
+        self.logger = logging.getLogger("RSPdx.DataStorage")
         self.max_history_size = max_history_size
-        self.waterfall_max_bins = 32768
-        self.waterfall_time_stride = 2
+        self.waterfall_max_bins = DEFAULT_WATERFALL_MAX_BINS
+        self.waterfall_time_stride = DEFAULT_WATERFALL_TIME_STRIDE
         self.smooth = False
         self.smooth_length = 11
         self.smooth_window = "hanning"
@@ -99,7 +103,11 @@ class DataStorage(QtCore.QObject):
 
     def update(self, data):
         if self.y is not None and len(data["y"]) != len(self.y):
-            print(f"{len(data['y']):d} bins coming from backend, expected {len(self.y):d} - resetting storage")
+            self.logger.warning(
+                "%d bins coming from backend, expected %d; resetting storage",
+                len(data["y"]),
+                len(self.y),
+            )
             self.x = None
             self.x_wf = None
             self.history = None

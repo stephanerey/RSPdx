@@ -4,6 +4,13 @@
 
 This document expands upon the **Architecture Cleanup Checklist** provided in the PRD library.  It adapts the generic recommendations to the specifics of the RSPdx project.  The objective is to perform mechanical refactoring that improves the code structure and maintainability **without changing the user‑visible behaviour or degrading performance**.  The refactor will set the stage for future features such as additional demodulators and UI redesign by ensuring a clear separation of concerns.
 
+## Applied implementation decision
+
+- **Retain SoapySDR as the hardware access layer.**
+  - The refactor keeps `SoapySDR` as the only hardware abstraction in this phase.
+  - The main reason is to preserve a future path toward supporting SDR devices beyond SDRplay without reworking the acquisition layer again.
+  - Direct SDRplay API integration is intentionally deferred and is not part of this cleanup phase.
+
 ## Checklist
 
 - **Normalize imports**

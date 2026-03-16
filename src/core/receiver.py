@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import numpy as np
 from typing import Optional, Callable
 import threading
@@ -8,22 +9,23 @@ from PyQt5 import QtCore
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot
 from scipy.signal import lfilter
 
-from .dsp.dsp import (
-    design_lpf_fir,
-)
+from src.core.demodulators import FMAudioMode, build_demodulator_registry
+
+from .dsp import design_lpf_fir, mix_to_baseband_block, streaming_decimate
 from .dsp.resampler import RationalResampler
 
 # =========================================================
 #                        LOGS
 # =========================================================
 DEBUG_RX = False  # passe à True pour diagnostiquer
+LOGGER = logging.getLogger("RSPdx.Receiver")
 
 
 def _log_rx(*args):
     if not DEBUG_RX:
         return
     ts = QtCore.QTime.currentTime().toString("HH:mm:ss.zzz")
-    print(f"[RX][{ts}]", *args)
+    LOGGER.debug("[RX][%s] %s", ts, " ".join(str(arg) for arg in args))
 
 
 # =========================================================
@@ -41,6 +43,10 @@ class Receiver(QObject):
     frequency_changed = pyqtSignal(float)  # fréquence absolue sélectionnée (Hz)
     bandwidth_changed = pyqtSignal(float)  # BW (Hz)
     quality_updated = pyqtSignal(dict)     # lock/EVM/qualité symbole
+    demodulator_changed = pyqtSignal(str)
+    audio_state_changed = pyqtSignal(bool)
+    perf_updated = pyqtSignal(dict)
+    error = pyqtSignal(str)
 
     def __init__(
         self,
@@ -106,10 +112,23 @@ class Receiver(QObject):
         self._eq_upd_norm = 0.0
         self._last_quality_emit = 0.0
         self._quality_interval_s = 0.20
+        self._perf_interval_s = 1.0
+        self._perf_last_emit_at = time.monotonic()
+        self._perf_blocks = 0
+        self._perf_input_samples = 0
+        self._perf_baseband_samples = 0
+        self._perf_process_time_s = 0.0
+        self._perf_process_time_max_s = 0.0
+        self._perf_demod_time_s = 0.0
+        self._perf_demod_time_max_s = 0.0
 
         # Démodulateur (ex: FMDemodulator)
         self.demod = None
+        self.demod_mode = "fm"
         self.demod_enabled = False
+        self.audio_enabled = False
+        self._audio_output_device = None
+        self._demodulator_registry = build_demodulator_registry()
 
         # Constellation
         self.constellation_mode = "raw"   # "raw" | "symbols"
@@ -159,6 +178,175 @@ class Receiver(QObject):
                 self.demod.set_input_rate(self._fs_bb)
             except Exception as e:
                 _log_rx(f"{self.name}: demod.set_input_rate error: {e!r}")
+
+    def _build_demodulator(self, demod_mode: str):
+        mode = str(demod_mode).lower()
+        if mode == "fm":
+            return self._demodulator_registry["fm"](
+                audio_rate=48_000,
+                deemph_us=50.0,
+                mode=FMAudioMode.NARROW,
+            )
+        factory = self._demodulator_registry.get(mode)
+        if factory is None:
+            factory = self._demodulator_registry["fm"]
+            mode = "fm"
+        return factory()
+
+    def _emit_error(self, message: str) -> None:
+        LOGGER.error("%s: %s", self.name, message)
+        self.error.emit(message)
+
+    def _start_demod_audio(self, output_device=None) -> None:
+        if self.demod is None:
+            self.demod = self._build_demodulator(self.demod_mode)
+            self.demod.set_input_rate(self._fs_bb)
+        self.demod.start(output_device=output_device)
+        self.audio_enabled = True
+        self.audio_state_changed.emit(True)
+
+    def _stop_demod_audio(self) -> None:
+        if self.demod is not None:
+            self.demod.stop()
+        self.audio_enabled = False
+        self.audio_state_changed.emit(False)
+
+    @pyqtSlot(str)
+    def set_demod_mode(self, demod_mode: str):
+        mode = str(demod_mode).lower()
+        old_demod = self.demod
+        old_running = bool(getattr(old_demod, "_running", False)) or bool(self.audio_enabled)
+        if old_demod is not None:
+            try:
+                old_demod.stop()
+            except Exception:
+                pass
+
+        try:
+            new_demod = self._build_demodulator(mode)
+            new_demod.set_input_rate(self._fs_bb)
+        except Exception as exc:
+            self._emit_error(f"Unable to create demodulator '{mode}': {exc}")
+            return
+
+        self.demod = new_demod
+        self.demod_mode = mode
+        self.demodulator_changed.emit(mode)
+
+        if old_running:
+            try:
+                self._start_demod_audio(self._audio_output_device)
+            except Exception as exc:
+                self.audio_enabled = False
+                self.audio_state_changed.emit(False)
+                self._emit_error(f"Audio start failed: {exc}")
+
+    @pyqtSlot(bool)
+    def set_audio_enabled(self, enabled: bool):
+        enabled = bool(enabled)
+        if enabled:
+            try:
+                self._start_demod_audio(self._audio_output_device)
+            except Exception as exc:
+                self.audio_enabled = False
+                self.audio_state_changed.emit(False)
+                self._emit_error(f"Audio start failed: {exc}")
+        else:
+            try:
+                self._stop_demod_audio()
+            except Exception as exc:
+                self._emit_error(f"Audio stop failed: {exc}")
+
+    @pyqtSlot(int)
+    def set_audio_output_device(self, device_index: int):
+        self._audio_output_device = None if int(device_index) < 0 else int(device_index)
+        if self.demod is None:
+            return
+        if bool(getattr(self.demod, "_running", False)) or bool(self.audio_enabled):
+            try:
+                self.demod.stop()
+                self._start_demod_audio(self._audio_output_device)
+            except Exception as exc:
+                self.audio_enabled = False
+                self.audio_state_changed.emit(False)
+                self._emit_error(f"Audio device switch failed: {exc}")
+
+    @pyqtSlot()
+    def shutdown(self):
+        self._running = False
+        self._reconfig.set()
+        try:
+            if self._bw_timer.isActive():
+                self._bw_timer.stop()
+            self._stop_demod_audio()
+        except Exception:
+            pass
+
+    def _emit_perf_snapshot(self, now: float) -> None:
+        elapsed = now - self._perf_last_emit_at
+        if elapsed < self._perf_interval_s:
+            return
+
+        demod_stats = {}
+        if self.demod is not None and hasattr(self.demod, "get_runtime_stats"):
+            try:
+                demod_stats = dict(self.demod.get_runtime_stats())
+            except Exception:
+                demod_stats = {}
+
+        snapshot = {
+            "name": self.name,
+            "demod_mode": str(self.demod_mode).upper(),
+            "audio_enabled": bool(self.audio_enabled),
+            "selected_freq_hz": float(self._selected_freq),
+            "bandwidth_hz": float(self._bandwidth),
+            "sample_rate_hz": float(self.sample_rate),
+            "baseband_rate_hz": float(self._fs_bb),
+            "iq_block_rate_hz": self._perf_blocks / max(elapsed, 1e-9),
+            "input_msample_s": self._perf_input_samples / max(elapsed, 1e-9) / 1_000_000.0,
+            "baseband_ksample_s": self._perf_baseband_samples / max(elapsed, 1e-9) / 1_000.0,
+            "process_avg_ms": 1000.0 * self._perf_process_time_s / max(1, self._perf_blocks),
+            "process_max_ms": 1000.0 * self._perf_process_time_max_s,
+            "demod_avg_ms": 1000.0 * self._perf_demod_time_s / max(1, self._perf_blocks),
+            "demod_max_ms": 1000.0 * self._perf_demod_time_max_s,
+            "thread_name": getattr(self, "_thread_name", self.name),
+        }
+        snapshot.update(demod_stats)
+        self.perf_updated.emit(snapshot)
+        self._perf_last_emit_at = now
+        self._perf_blocks = 0
+        self._perf_input_samples = 0
+        self._perf_baseband_samples = 0
+        self._perf_process_time_s = 0.0
+        self._perf_process_time_max_s = 0.0
+        self._perf_demod_time_s = 0.0
+        self._perf_demod_time_max_s = 0.0
+
+    @pyqtSlot()
+    def reset_runtime_stats(self) -> None:
+        self._perf_last_emit_at = time.monotonic()
+        self._perf_blocks = 0
+        self._perf_input_samples = 0
+        self._perf_baseband_samples = 0
+        self._perf_process_time_s = 0.0
+        self._perf_process_time_max_s = 0.0
+        self._perf_demod_time_s = 0.0
+        self._perf_demod_time_max_s = 0.0
+        if self.demod is not None and hasattr(self.demod, "reset_runtime_stats"):
+            try:
+                self.demod.reset_runtime_stats()
+            except Exception:
+                pass
+
+    def _record_perf(self, input_samples: int, baseband_samples: int, process_time_s: float, demod_time_s: float) -> None:
+        self._perf_blocks += 1
+        self._perf_input_samples += int(max(0, input_samples))
+        self._perf_baseband_samples += int(max(0, baseband_samples))
+        self._perf_process_time_s += float(max(0.0, process_time_s))
+        self._perf_process_time_max_s = max(self._perf_process_time_max_s, float(max(0.0, process_time_s)))
+        self._perf_demod_time_s += float(max(0.0, demod_time_s))
+        self._perf_demod_time_max_s = max(self._perf_demod_time_max_s, float(max(0.0, demod_time_s)))
+        self._emit_perf_snapshot(time.monotonic())
 
     @pyqtSlot(float)
     def set_sample_rate(self, fs_hz: float):
@@ -1032,6 +1220,12 @@ class Receiver(QObject):
     # --------------------- Traitement ---------------------
     @pyqtSlot(np.ndarray)
     def process_block(self, iq_block: np.ndarray):
+        try:
+            self._process_block_impl(iq_block)
+        except Exception:
+            LOGGER.exception("%s: unhandled error in process_block", self.name)
+
+    def _process_block_impl(self, iq_block: np.ndarray):
         """
         Appelé par la boucle SDR (flux IQ au taux self.sample_rate).
         Produit bb à fs_bb et l'envoie au démod (s'il est démarré).
@@ -1041,90 +1235,103 @@ class Receiver(QObject):
         if iq_block is None or iq_block.size < 2:
             return
 
-        fs = self.sample_rate
-        # offset: fréquence sélectionnée vs centre SDR
+        started_at = time.perf_counter()
+        baseband_samples = 0
+        demod_time_s = 0.0
+
         try:
-            fc = float(self._center_freq_provider())
-        except Exception:
-            fc = 0.0
-        f_off = float(self._selected_freq - fc)
-
-        # 1) translation en bande de base avec phase continue entre blocs
-        if abs(f_off) < 1e-12 or fs <= 0:
-            bb = iq_block
-        else:
-            step = -2.0 * np.pi * f_off / fs
-            n = np.arange(iq_block.size, dtype=np.float32)
-            phase = self._mix_phase + step * n
-            osc = np.exp(1j * phase).astype(np.complex64, copy=False)
-            bb = iq_block * osc
-            self._mix_phase = float((self._mix_phase + step * iq_block.size) % (2.0 * np.pi))
-
-        # 1b) pré-décimation coarse pour limiter la charge CPU aux fortes FS.
-        bb = self._apply_pre_decim_streaming(bb)
-        if bb.size < 2:
-            return
-
-        # 2) filtrage sous-bande avec état FIR conservé entre blocs
-        taps = self._taps_cache
-        if taps is not None:
-            zi = self._fir_zi
-            if zi is None or zi.size != max(0, len(taps) - 1):
-                zi = np.zeros(max(0, len(taps) - 1), dtype=np.complex64)
-            bb, self._fir_zi = lfilter(taps, [1.0], bb, zi=zi)
-
-        # 3) décimation entière en mode streaming (phase conservée entre blocs)
-        d = int(self._decim) if self._decim else 1
-        if d > 1:
-            n_in = int(bb.size)
-            start = (-self._decim_phase) % d
-            bb = bb[start::d]
-            self._decim_phase = (self._decim_phase + n_in) % d
-        fs_bb = self._fs_bb
-
-        # 3b) correction IQ logicielle (déséquilibre gain/phase + DC)
-        bb = self._apply_iq_correction(bb)
-        if bb.size < 2:
-            return
-
-        # 3c) filtre adapté (RRC) pour profil numérique (ex: TETRA)
-        if self.modulation_profile == "tetra":
-            bb, fs_bb = self._apply_tetra_symbol_resample(bb, fs_bb)
-            if bb.size < 2:
-                return
-            bb = self._apply_rrc_streaming(bb)
-            if bb.size < 2:
-                return
-
-        # 4) (optionnel) boucle de Costas
-        use_costas = bool(self.enable_costas)
-        if self.modulation_profile == "tetra" and self.constellation_domain == "differential":
-            # En affichage différentiel, Costas apporte peu et peut injecter du jitter.
-            use_costas = False
-        self._costas_active_last = use_costas
-        if use_costas:
-            bb = self._apply_costas_streaming(bb)
-
-        # 5) envoi vers le démod (asynchrone audio; NE PAS bloquer)
-        if self.demod is not None and getattr(self.demod, "_running", False):
+            fs = self.sample_rate
+            # offset: fréquence sélectionnée vs centre SDR
             try:
-                self.demod.process_block(bb, fs_bb)
-            except Exception as e:
-                _log_rx(f"{self.name}: demod.process_block error: {e!r}")
+                fc = float(self._center_freq_provider())
+            except Exception:
+                fc = 0.0
+            f_off = float(self._selected_freq - fc)
 
-        # 6) sortie IQ post-traitement (affichages, enregistrements, etc.)
-        try:
-            if self.constellation_mode == "symbols":
-                points = self._extract_symbol_samples(bb, fs_bb)
-                points = self._apply_symbol_equalizer(points)
-                points = self._map_constellation_domain(points)
-                if points.size:
-                    self._maybe_emit_quality(points, fs_bb)
-                    self.iq_out.emit(points)
+            # 1) translation en bande de base avec phase continue entre blocs
+            if abs(f_off) < 1e-12 or fs <= 0:
+                bb = iq_block
             else:
-                points = self._map_constellation_domain(bb)
-                if points.size:
-                    self._maybe_emit_quality(points, fs_bb)
-                    self.iq_out.emit(points)
-        except Exception:
-            pass
+                bb, self._mix_phase = mix_to_baseband_block(
+                    iq_block,
+                    frequency_offset_hz=f_off,
+                    sample_rate_hz=fs,
+                    initial_phase=self._mix_phase,
+                )
+
+            # 1b) pré-décimation coarse pour limiter la charge CPU aux fortes FS.
+            bb = self._apply_pre_decim_streaming(bb)
+            if bb.size < 2:
+                return
+
+            # 2) filtrage sous-bande avec état FIR conservé entre blocs
+            taps = self._taps_cache
+            if taps is not None:
+                zi = self._fir_zi
+                if zi is None or zi.size != max(0, len(taps) - 1):
+                    zi = np.zeros(max(0, len(taps) - 1), dtype=np.complex64)
+                bb, self._fir_zi = lfilter(taps, [1.0], bb, zi=zi)
+
+            # 3) décimation entière en mode streaming (phase conservée entre blocs)
+            d = int(self._decim) if self._decim else 1
+            if d > 1:
+                bb, self._decim_phase = streaming_decimate(bb, d, self._decim_phase)
+            fs_bb = self._fs_bb
+
+            # 3b) correction IQ logicielle (déséquilibre gain/phase + DC)
+            bb = self._apply_iq_correction(bb)
+            if bb.size < 2:
+                return
+
+            # 3c) filtre adapté (RRC) pour profil numérique (ex: TETRA)
+            if self.modulation_profile == "tetra":
+                bb, fs_bb = self._apply_tetra_symbol_resample(bb, fs_bb)
+                if bb.size < 2:
+                    return
+                bb = self._apply_rrc_streaming(bb)
+                if bb.size < 2:
+                    return
+
+            # 4) (optionnel) boucle de Costas
+            use_costas = bool(self.enable_costas)
+            if self.modulation_profile == "tetra" and self.constellation_domain == "differential":
+                # En affichage différentiel, Costas apporte peu et peut injecter du jitter.
+                use_costas = False
+            self._costas_active_last = use_costas
+            if use_costas:
+                bb = self._apply_costas_streaming(bb)
+
+            baseband_samples = int(bb.size)
+
+            # 5) envoi vers le démod (asynchrone audio; NE PAS bloquer)
+            if self.demod is not None and getattr(self.demod, "_running", False):
+                try:
+                    demod_started_at = time.perf_counter()
+                    self.demod.process_block(bb, fs_bb)
+                    demod_time_s = time.perf_counter() - demod_started_at
+                except Exception as e:
+                    _log_rx(f"{self.name}: demod.process_block error: {e!r}")
+
+            # 6) sortie IQ post-traitement (affichages, enregistrements, etc.)
+            try:
+                if self.constellation_mode == "symbols":
+                    points = self._extract_symbol_samples(bb, fs_bb)
+                    points = self._apply_symbol_equalizer(points)
+                    points = self._map_constellation_domain(points)
+                    if points.size:
+                        self._maybe_emit_quality(points, fs_bb)
+                        self.iq_out.emit(points)
+                else:
+                    points = self._map_constellation_domain(bb)
+                    if points.size:
+                        self._maybe_emit_quality(points, fs_bb)
+                        self.iq_out.emit(points)
+            except Exception:
+                pass
+        finally:
+            self._record_perf(
+                int(iq_block.size),
+                baseband_samples,
+                time.perf_counter() - started_at,
+                demod_time_s,
+            )

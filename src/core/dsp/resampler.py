@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 import numpy as np
 from fractions import Fraction
 from dataclasses import dataclass
@@ -6,10 +7,11 @@ from typing import Optional
 
 # ---------- Debug logging ----------
 DEBUG_RESAMPLER = False  # passe à True pour diagnostiquer
+LOGGER = logging.getLogger("RSPdx.Resampler")
 
 def _log_rs(*args):
     if DEBUG_RESAMPLER:
-        print("[RS]", *args)
+        LOGGER.debug("[RS] %s", " ".join(str(arg) for arg in args))
 
 @dataclass
 class ResampleRatio:

@@ -1,12 +1,25 @@
 # src/gui/receiver_tab.py
 from PyQt5 import QtWidgets, QtCore
-from src.core.demodulators.fm import FMDemodulator, FMAudioMode
+from src.core.demodulators import FMDemodulator
 import sounddevice as sd
 
 class ReceiverTab(QtWidgets.QWidget):
     """
-    Panneau Receiver + section Audio (FM).
+    Receiver panel with RF controls and audio demodulator selection.
     """
+    request_set_frequency = QtCore.pyqtSignal(float)
+    request_set_bandwidth = QtCore.pyqtSignal(float)
+    request_set_costas_enabled = QtCore.pyqtSignal(bool)
+    request_set_costas_mode = QtCore.pyqtSignal(str)
+    request_set_iq_correction_enabled = QtCore.pyqtSignal(bool)
+    request_set_modulation_profile = QtCore.pyqtSignal(str)
+    request_set_constellation_mode = QtCore.pyqtSignal(str)
+    request_set_constellation_domain = QtCore.pyqtSignal(str)
+    request_set_symbol_rate = QtCore.pyqtSignal(float)
+    request_set_demod_mode = QtCore.pyqtSignal(str)
+    request_set_audio_enabled = QtCore.pyqtSignal(bool)
+    request_set_audio_device = QtCore.pyqtSignal(int)
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -59,19 +72,30 @@ class ReceiverTab(QtWidgets.QWidget):
         form.addRow("Symbol rate:", self.symbolRateSpin)
         form.addRow("Constellation quality:", self.syncLabel)
 
-        # --- Audio FM ---
-        sep = QtWidgets.QLabel("<b>Audio (FM)</b>")
+        # --- Audio demodulator ---
+        sep = QtWidgets.QLabel("<b>Audio demodulator</b>")
         form.addRow(sep)
 
-        self.fmEnable = QtWidgets.QCheckBox("FM audio")
+        self.audioEnable = QtWidgets.QCheckBox("Enable audio")
+        self.demodButtonGroup = QtWidgets.QButtonGroup(self)
+        self.demodButtons = {}
+        demodLayout = QtWidgets.QHBoxLayout()
+        for demod_key, label in (("am", "AM"), ("fm", "FM"), ("usb", "USB"), ("lsb", "LSB"), ("cw", "CW")):
+            button = QtWidgets.QRadioButton(label)
+            self.demodButtonGroup.addButton(button)
+            self.demodButtons[demod_key] = button
+            demodLayout.addWidget(button)
+        demodLayout.addStretch(1)
+
         self.audioDevice = QtWidgets.QComboBox()
         self.refreshBtn = QtWidgets.QPushButton("↻")
 
         h = QtWidgets.QHBoxLayout()
         h.addWidget(self.audioDevice, 1)
         h.addWidget(self.refreshBtn, 0)
+        form.addRow("Mode:", demodLayout)
         form.addRow("Output device:", h)
-        form.addRow(self.fmEnable)
+        form.addRow(self.audioEnable)
 
         # état
         self._rx = None
@@ -90,9 +114,10 @@ class ReceiverTab(QtWidgets.QWidget):
         self.symbolRateSpin.valueChanged.connect(self._on_symbol_rate_changed)
 
         # signals audio
-        self.fmEnable.toggled.connect(self._on_fm_toggled)
+        self.audioEnable.toggled.connect(self._on_audio_toggled)
         self.audioDevice.currentIndexChanged.connect(self._on_device_changed)
         self.refreshBtn.clicked.connect(self._populate_devices)
+        self.demodButtonGroup.buttonToggled.connect(self._on_demod_button_toggled)
 
     def _populate_devices(self):
         self.audioDevice.blockSignals(True)
@@ -123,27 +148,22 @@ class ReceiverTab(QtWidgets.QWidget):
     def bind(self, rx, spectrum_widget):
         self._rx = rx
         self._spec = spectrum_widget
-
-        # instancie le demod si absent
-        if getattr(rx, "demod", None) is None:
-            rx.demod = FMDemodulator(
-                audio_rate=48_000,
-                deemph_us=50.0,  # 50 µs pour WFM (Europe) ; pour NFM c'est ignoré
-                mode=FMAudioMode.NARROW  # ou FMAudioMode.WIDE suivant ton usage
-            )
+        rx.demod_mode = getattr(rx, "demod_mode", "fm")
 
         self._populate_devices()
+        self.request_set_frequency.connect(rx.set_selected_frequency, type=QtCore.Qt.QueuedConnection)
+        self.request_set_bandwidth.connect(rx.set_bandwidth, type=QtCore.Qt.QueuedConnection)
+        self.request_set_costas_enabled.connect(rx.set_costas_enabled, type=QtCore.Qt.QueuedConnection)
+        self.request_set_costas_mode.connect(rx.set_costas_mode, type=QtCore.Qt.QueuedConnection)
+        self.request_set_iq_correction_enabled.connect(rx.set_iq_correction_enabled, type=QtCore.Qt.QueuedConnection)
+        self.request_set_modulation_profile.connect(rx.set_modulation_profile, type=QtCore.Qt.QueuedConnection)
+        self.request_set_constellation_mode.connect(rx.set_constellation_mode, type=QtCore.Qt.QueuedConnection)
+        self.request_set_constellation_domain.connect(rx.set_constellation_domain, type=QtCore.Qt.QueuedConnection)
+        self.request_set_symbol_rate.connect(rx.set_symbol_rate, type=QtCore.Qt.QueuedConnection)
+        self.request_set_demod_mode.connect(rx.set_demod_mode, type=QtCore.Qt.QueuedConnection)
+        self.request_set_audio_enabled.connect(rx.set_audio_enabled, type=QtCore.Qt.QueuedConnection)
+        self.request_set_audio_device.connect(rx.set_audio_output_device, type=QtCore.Qt.QueuedConnection)
 
-        # démarre l’audio par défaut
-        try:
-            # informe le démod du FS courant (au cas où)
-            if getattr(rx, "demod", None) is not None:
-                rx.demod.set_input_rate(getattr(rx, "_fs_bb", rx.sample_rate))
-        except Exception:
-            pass
-
-        # coche la case et lance la sortie audio sur le device sélectionné
-        self.fmEnable.setChecked(True)  # déclenche _on_fm_toggled -> start()
         self._guard = True
         try:
             self.freqSpin.setValue(rx.selected_freq / 1e6)
@@ -161,11 +181,16 @@ class ReceiverTab(QtWidgets.QWidget):
             idx_d = self.constDomain.findData(domain)
             self.constDomain.setCurrentIndex(idx_d if idx_d >= 0 else 0)
             self.symbolRateSpin.setValue(float(getattr(rx, "symbol_rate", 18_000.0)) / 1e3)
+            self._set_demod_button(rx.demod_mode)
+            self.audioEnable.setChecked(bool(getattr(rx, "audio_enabled", False)))
         finally:
             self._guard = False
 
         rx.frequency_changed.connect(self._on_rx_freq_changed)
         rx.bandwidth_changed.connect(self._on_rx_bw_changed)
+        rx.demodulator_changed.connect(self._on_rx_demod_changed)
+        rx.audio_state_changed.connect(self._on_rx_audio_state_changed)
+        rx.error.connect(self._on_rx_error)
         try:
             rx.quality_updated.connect(self._on_quality_updated)
         except Exception:
@@ -173,37 +198,49 @@ class ReceiverTab(QtWidgets.QWidget):
 
         spectrum_widget.receiver_frequency_changed.connect(self._on_spec_freq_changed)
         spectrum_widget.receiver_bandwidth_changed.connect(self._on_spec_bw_changed)
+        self.request_set_audio_device.emit(self._current_device_index())
 
     # — UI → RX —
     def _on_ui_freq_changed(self, mhz: float):
         if self._guard or self._rx is None:
             return
-        self._rx.set_selected_frequency(mhz * 1e6)
+        self.request_set_frequency.emit(mhz * 1e6)
 
     def _on_ui_bw_changed(self, khz: float):
         if self._guard or self._rx is None:
             return
-        self._rx.set_bandwidth(khz * 1e3)
+        self.request_set_bandwidth.emit(khz * 1e3)
+
+    def _set_demod_button(self, demod_mode: str):
+        button = self.demodButtons.get(str(demod_mode).lower())
+        if button is not None:
+            button.setChecked(True)
+
+    def _switch_demodulator(self, demod_mode: str):
+        if self._rx is None:
+            return
+        self.request_set_demod_mode.emit(str(demod_mode).lower())
+
+    def _on_demod_button_toggled(self, button, checked: bool):
+        if not checked or self._guard or self._rx is None:
+            return
+        for demod_mode, candidate in self.demodButtons.items():
+            if candidate is button:
+                self._switch_demodulator(demod_mode)
+                break
 
     def _on_costas_toggled(self, checked: bool):
         if self._rx is None: return
-        if hasattr(self._rx, "set_costas_enabled"):
-            self._rx.set_costas_enabled(bool(checked))
-        else:
-            self._rx.enable_costas = bool(checked)
+        self.request_set_costas_enabled.emit(bool(checked))
 
     def _on_costas_mode(self, text: str):
         if self._rx is None: return
-        if hasattr(self._rx, "set_costas_mode"):
-            self._rx.set_costas_mode(text)
-        else:
-            self._rx.costas_mode = text
+        self.request_set_costas_mode.emit(text)
 
     def _on_iqcorr_toggled(self, checked: bool):
         if self._guard or self._rx is None:
             return
-        if hasattr(self._rx, "set_iq_correction_enabled"):
-            self._rx.set_iq_correction_enabled(bool(checked))
+        self.request_set_iq_correction_enabled.emit(bool(checked))
 
     def _on_profile_changed(self, _):
         if self._guard or self._rx is None:
@@ -211,8 +248,7 @@ class ReceiverTab(QtWidgets.QWidget):
         prof = self.profileCombo.currentData()
         if prof is None:
             prof = "generic"
-        if hasattr(self._rx, "set_modulation_profile"):
-            self._rx.set_modulation_profile(str(prof))
+        self.request_set_modulation_profile.emit(str(prof))
         # Remet des valeurs utiles pour TETRA par défaut.
         if str(prof) == "tetra":
             self._guard = True
@@ -226,16 +262,12 @@ class ReceiverTab(QtWidgets.QWidget):
             finally:
                 self._guard = False
             # Appliquer explicitement côté RX après remise des contrôles.
-            if hasattr(self._rx, "set_costas_enabled"):
-                self._rx.set_costas_enabled(True)
-            if hasattr(self._rx, "set_costas_mode"):
-                self._rx.set_costas_mode("qpsk")
-            if hasattr(self._rx, "set_iq_correction_enabled"):
-                self._rx.set_iq_correction_enabled(True)
-            self._rx.set_constellation_mode("symbols")
-            if hasattr(self._rx, "set_constellation_domain"):
-                self._rx.set_constellation_domain("differential")
-            self._rx.set_symbol_rate(18_000.0)
+            self.request_set_costas_enabled.emit(True)
+            self.request_set_costas_mode.emit("qpsk")
+            self.request_set_iq_correction_enabled.emit(True)
+            self.request_set_constellation_mode.emit("symbols")
+            self.request_set_constellation_domain.emit("differential")
+            self.request_set_symbol_rate.emit(18_000.0)
 
     def _on_const_mode_changed(self, _):
         if self._guard or self._rx is None:
@@ -243,12 +275,12 @@ class ReceiverTab(QtWidgets.QWidget):
         mode = self.constMode.currentData()
         if mode is None:
             mode = "raw"
-        self._rx.set_constellation_mode(str(mode))
+        self.request_set_constellation_mode.emit(str(mode))
 
     def _on_symbol_rate_changed(self, ksym_s: float):
         if self._guard or self._rx is None:
             return
-        self._rx.set_symbol_rate(float(ksym_s) * 1e3)
+        self.request_set_symbol_rate.emit(float(ksym_s) * 1e3)
 
     def _on_const_domain_changed(self, _):
         if self._guard or self._rx is None:
@@ -256,8 +288,7 @@ class ReceiverTab(QtWidgets.QWidget):
         domain = self.constDomain.currentData()
         if domain is None:
             domain = "iq"
-        if hasattr(self._rx, "set_constellation_domain"):
-            self._rx.set_constellation_domain(str(domain))
+        self.request_set_constellation_domain.emit(str(domain))
 
     @QtCore.pyqtSlot(dict)
     def _on_quality_updated(self, info: dict):
@@ -303,37 +334,20 @@ class ReceiverTab(QtWidgets.QWidget):
             color = "#ffd166"
         self.syncLabel.setStyleSheet(f"color: {color};")
 
-    # — Audio FM —
+    # — Audio —
     def _current_device_index(self):
-        return self.audioDevice.currentData()
+        current = self.audioDevice.currentData()
+        return -1 if current is None else int(current)
 
-    def _on_fm_toggled(self, checked: bool):
-        if self._rx is None or self._rx.demod is None:
+    def _on_audio_toggled(self, checked: bool):
+        if self._rx is None:
             return
-        if checked:
-            dev = self._current_device_index()
-            try:
-                self._rx.demod.start(output_device=dev)
-            except Exception as e:
-                # si erreur device, on décoche
-                self.fmEnable.blockSignals(True)
-                self.fmEnable.setChecked(False)
-                self.fmEnable.blockSignals(False)
-                QtWidgets.QMessageBox.warning(self, "Audio error", str(e))
-        else:
-            self._rx.demod.stop()
+        self.request_set_audio_enabled.emit(bool(checked))
 
     def _on_device_changed(self, _):
-        if self._rx is None or self._rx.demod is None:
+        if self._rx is None:
             return
-        if self.fmEnable.isChecked():
-            # redémarre sur le nouveau device
-            dev = self._current_device_index()
-            try:
-                self._rx.demod.stop()
-                self._rx.demod.start(output_device=dev)
-            except Exception as e:
-                QtWidgets.QMessageBox.warning(self, "Audio error", str(e))
+        self.request_set_audio_device.emit(self._current_device_index())
 
     # — RX → UI —
     def _on_rx_freq_changed(self, f_hz: float):
@@ -349,6 +363,26 @@ class ReceiverTab(QtWidgets.QWidget):
             self.bwSpin.setValue(bw_hz / 1e3)
         finally:
             self._guard = False
+
+    @QtCore.pyqtSlot(str)
+    def _on_rx_demod_changed(self, demod_mode: str):
+        self._guard = True
+        try:
+            self._set_demod_button(demod_mode)
+        finally:
+            self._guard = False
+
+    @QtCore.pyqtSlot(bool)
+    def _on_rx_audio_state_changed(self, enabled: bool):
+        self.audioEnable.blockSignals(True)
+        try:
+            self.audioEnable.setChecked(bool(enabled))
+        finally:
+            self.audioEnable.blockSignals(False)
+
+    @QtCore.pyqtSlot(str)
+    def _on_rx_error(self, message: str):
+        QtWidgets.QMessageBox.warning(self, "Receiver error", message)
 
     # — Spectrum → UI (sans réémettre) —
     def _on_spec_freq_changed(self, f_hz: float):
