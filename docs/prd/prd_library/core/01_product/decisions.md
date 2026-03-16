@@ -1,20 +1,18 @@
-# Product Decisions
+# Product decisions
 
-> **PRD Policy:** **PROJECT (editable)** — Fill and update this file for the current project.
+> **PRD Policy:** **PROJECT (editable)** — Document and track the product decisions taken during the project lifecycle.
 
+**Last updated:** 2026‑03‑16
 
-**Last updated:** 2026-03-07
+Each decision should be recorded with an ID, date, status, context, the selected option, considered alternatives, consequences of the decision, and references to requirements, tasks or documents impacted.  Use this list to trace why certain choices were made and revisit them if assumptions change.
 
-Use this file for **product** decisions only: scope, user-facing behavior, prioritization, rollout, or policy.
+| ID | Date | Status | Context & problem | Decision | Alternatives | Consequences | Affected references |
+|---|---|---|---|---|---|---|---|
+| **D‑001 – Language & performance strategy** | 2026‑03‑16 | Active | The existing RSPdx prototype is written entirely in Python.  Heavy DSP operations (FFTs, filtering, demodulation) can saturate CPU cores and lead to high latency. | Use **Python** for orchestration, UI and high‑level logic, and leverage **C/C++ libraries** (e.g. FFTW, custom FIR filters) with bindings (CFFI, Cython, Pybind11) for compute‑intensive DSP. | 1. Pure Python with Numpy/SciPy for DSP. 2. Rewrite entire application in C++ similar to SDR++. | Hybrid architecture adds build complexity (native extensions, compiler toolchain) and increases packaging effort, but enables performance gains without sacrificing Python’s rapid development and community. | KPIs: CPU utilisation, audio latency.  Architecture documents: overview.md, external_dependencies.md. |
+| **D‑002 – Thread management reuse** | 2026‑03‑16 | Active | Reliable, observable thread management is required to handle multiple receivers and plugins concurrently.  An existing `ThreadManager` implementation from the Antrack project provides a tested solution with a UI for thread statistics. | **Integrate the Antrack ThreadManager** into RSPdx, including the UI component for monitoring thread status and performance. | 1. Implement a new thread manager using Python `QThread` and `asyncio`. 2. Use the standard `concurrent.futures` module with ad‑hoc monitoring. | Reuse reduces development effort and risk.  The Antrack implementation may need minor modifications to fit the new architecture.  Developers must understand its interface and incorporate its UI component. | Tasks: Refactor (P10) to integrate ThreadManager.  Risks: compatibility between Antrack and RSPdx event loops. |
+| **D‑003 – Plugin‑oriented architecture** | 2026‑03‑16 | Active | Extensibility is a core requirement.  Users and third parties should be able to add new demodulators or analysis modules without modifying the core. | Adopt a **plugin system** inspired by SDR++: demodulators and analysis modules are packaged as dynamically loaded plugins that register themselves via a stable API.  Define plugin life‑cycle methods (init, process, destroy) and standard data structures for IQ and symbol streams. | 1. Build demodulators as Python packages loaded via `importlib`. 2. Keep all demodulators in the core repository and add compile‑time configuration. | Enables independent development and distribution of modules.  Adds complexity in API design, binary compatibility and testing.  Must handle versioning and dependency isolation for plugins. | Architecture: overview.md, versioning_and_release_policy.md.  Requirements: REQ‑002 (plugin architecture). |
+| **D‑004 – Hardware access library** | 2026‑03‑16 | Active | Accessing the SDRplay RSPdx hardware requires vendor libraries.  There are multiple approaches with different licensing implications. | Use **SoapySDR** in combination with the **SDRplay API** to access the RSPdx device.  SoapySDR provides a unified abstraction layer and allows switching to other SDR hardware in the future. | 1. Directly integrate SDRplay API via Python bindings. 2. Use other frameworks (e.g. GNU Radio, RTL‑SDR) and wrap RSPdx support manually. | SoapySDR ensures cross‑platform support and ease of switching devices.  The SDRplay API may impose license limitations; bundling with Python packages must respect vendor terms. | Architecture: external_dependencies.md, runtime_environment.md.  Constraints: licensing. |
 
-## Decision template
-- **ID:** `D-###`
-- **Date:** `YYYY-MM-DD`
-- **Context:** <why this decision is needed>
-- **Decision:** <what was chosen>
-- **Alternatives considered:** <short list>
-- **Consequences:** <trade-offs and follow-up>
-- **Affected refs:** <PRD docs / REQ / F / API / IFC>
+## Decision lifecycle
 
-## Decisions
-- `D-001`: <...>
+Decisions are initially recorded with **Active** status.  As the project progresses, they may become **Validated** (confirmed by implementation and testing), **Deprecated** (replaced by a new decision) or **Abandoned** (not pursued).  Any change in status should be logged here with the rationale.
