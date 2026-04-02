@@ -4,12 +4,22 @@ from PyQt5 import QtWidgets, QtCore, uic, QtGui
 
 from src.config.settings import UI_FILE_NAME
 from src.gui.display_controller import DisplayController
+from src.gui.gain_table_ui import AutoGainTableDock
 from src.gui.receivers_ui import ReceiversUI
 from src.gui.monitoring_controller import MonitoringDockController
 from src.gui.receiver_runtime import ReceiverRuntimeCoordinator
 
 from src.core.sdr import SDRController
 from src.core.receivers_manager import ReceiversManager
+from src.tools.gain_table import clamp_lna_state, lna_attenuation_db, max_lna_state_for_frequency
+
+
+SPECTRUM_TRACE_SMOOTHING_PRESETS = [
+    ("Off", 1.0),
+    ("Light", 0.65),
+    ("Medium", 0.35),
+    ("Strong", 0.18),
+]
 
 
 class SDRGUI(QtWidgets.QMainWindow):
@@ -41,6 +51,9 @@ class SDRGUI(QtWidgets.QMainWindow):
         self.controller = SDRController(thread_manager=thread_manager)
         self.controller.sample_rate_changed.connect(self._on_controller_fs_changed)
         self.controller.center_frequency_changed.connect(self._set_spin_center_freq_from_controller)
+        self.controller.center_frequency_changed.connect(self._on_controller_center_frequency_changed)
+        self._current_center_frequency_hz = float(self.controller.center_freq)
+        self.auto_gain_dock = None
 
         # 1) Fréquence centrale depuis l’UI
         init_freq_hz = float(self.freqSpinBox_2.value()) * 1e6
@@ -71,6 +84,8 @@ class SDRGUI(QtWidgets.QMainWindow):
             receiver_runtime=self.receiver_runtime,
         )
         self.monitoring_controller.setup()
+        self._setup_gain_controls_ui()
+        self._setup_auto_gain_dock()
 
         # --- RX1 par défaut ---
         self._setup_default_receiver()
@@ -105,6 +120,19 @@ class SDRGUI(QtWidgets.QMainWindow):
         finally:
             self.freqSpinBox_2.blockSignals(False)
 
+    def _on_controller_center_frequency_changed(self, f_hz: float) -> None:
+        """Refresh frequency-dependent gain helpers after controller updates."""
+        self._current_center_frequency_hz = float(f_hz)
+        if not hasattr(self, "RFGRHorizontalSlider"):
+            return
+        self._update_rf_slider_range()
+        if self.auto_gain_dock is not None:
+            self.auto_gain_dock.widget.set_current_frequency(f_hz)
+        if hasattr(self, "autoGainCheckBox") and self.autoGainCheckBox.isChecked():
+            self._apply_auto_gain_profile()
+        else:
+            self._update_gain_labels()
+
     # ---------- Init auxiliaire ----------
     def _populate_combos_safely(self):
         """Populate hardware-dependent combo boxes without triggering change handlers."""
@@ -133,6 +161,60 @@ class SDRGUI(QtWidgets.QMainWindow):
             self.sampleRateComboBox.blockSignals(False)
             self.antennaComboBox.blockSignals(False)
 
+    def _setup_gain_controls_ui(self) -> None:
+        """Install gain-related helper widgets in the source controls dock."""
+        layout = self.controlsDockWidgetContents.layout()
+
+        self.ifAttenuationValueLabel = QtWidgets.QLabel(self.controlsDockWidgetContents)
+        self.ifAttenuationValueLabel.setObjectName("ifAttenuationValueLabel")
+        self.ifAttenuationValueLabel.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        layout.addWidget(self.ifAttenuationValueLabel, 5, 1)
+
+        self.lnaAttenuationValueLabel = QtWidgets.QLabel(self.controlsDockWidgetContents)
+        self.lnaAttenuationValueLabel.setObjectName("lnaAttenuationValueLabel")
+        self.lnaAttenuationValueLabel.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        layout.addWidget(self.lnaAttenuationValueLabel, 6, 1)
+
+        self.autoGainCheckBox = QtWidgets.QCheckBox("Auto table", self.controlsDockWidgetContents)
+        self.autoGainCheckBox.setObjectName("autoGainCheckBox")
+        self.autoGainCheckBox.setToolTip("Use the auto gain lookup table instead of manual sliders.")
+        layout.addWidget(self.autoGainCheckBox, 7, 1)
+
+        self.traceAverageLabel = QtWidgets.QLabel("Trace avg:", self.controlsDockWidgetContents)
+        self.traceAverageLabel.setObjectName("traceAverageLabel")
+        self.traceAverageComboBox = QtWidgets.QComboBox(self.controlsDockWidgetContents)
+        self.traceAverageComboBox.setObjectName("traceAverageComboBox")
+        self.traceAverageComboBox.setToolTip("Temporal FFT smoothing. Higher levels stabilize the trace with minimal FPS cost.")
+        for label, alpha in SPECTRUM_TRACE_SMOOTHING_PRESETS:
+            self.traceAverageComboBox.addItem(label, float(alpha))
+        layout.addWidget(self.traceAverageLabel, 5, 2)
+        layout.addWidget(self.traceAverageComboBox, 6, 2)
+        self._set_trace_average_preset(self.controller.spectrum_trace_alpha)
+
+        self._set_slider_value(self.IFGRHorizontalSlider, int(self.controller.if_gain))
+        self._set_slider_value(self.RFGRHorizontalSlider, int(self.controller.rf_gain))
+        self._update_rf_slider_range()
+        self._update_gain_labels()
+
+        if hasattr(self, "smoothButton"):
+            self.smoothButton.hide()
+
+    def _setup_auto_gain_dock(self) -> None:
+        """Create the editable auto-gain dock and expose it in the View menu."""
+        self.auto_gain_dock = AutoGainTableDock(self)
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.auto_gain_dock)
+        if hasattr(self, "settingsDockWidget"):
+            self.tabifyDockWidget(self.settingsDockWidget, self.auto_gain_dock)
+        self.auto_gain_dock.widget.activeLevelChanged.connect(self._on_auto_gain_profile_changed)
+        self.auto_gain_dock.widget.profilesChanged.connect(self._on_auto_gain_profiles_changed)
+        self.auto_gain_dock.widget.set_current_frequency(self._current_center_frequency_hz)
+
+        menu_view = getattr(self.monitoring_controller, "menu_view", None)
+        if menu_view is not None:
+            action = QtWidgets.QAction("Auto Gain Table", self)
+            action.triggered.connect(self.show_auto_gain_dock)
+            menu_view.addAction(action)
+
     def _connect_ui_signals(self):
         """Bind Qt widgets to their corresponding controller and helper slots."""
         self.startButton.clicked.connect(self.start_sdr)
@@ -142,6 +224,7 @@ class SDRGUI(QtWidgets.QMainWindow):
         self.IFGRHorizontalSlider.valueChanged.connect(self.update_ifgain)
         self.RFGRHorizontalSlider.valueChanged.connect(self.update_rfgain)
         self.AGCCheckBox.stateChanged.connect(self.set_agc)
+        self.autoGainCheckBox.toggled.connect(self.set_auto_gain_mode)
         self.biasTeeCheckBox.stateChanged.connect(self.set_biastee)
         self.FMNotchCheckBox.stateChanged.connect(self.set_fmnotch)
         self.DABNotchCheckBox.stateChanged.connect(self.set_dabnotch)
@@ -155,6 +238,8 @@ class SDRGUI(QtWidgets.QMainWindow):
             self.averageCheckBox.toggled.connect(self.on_average_toggled)
         if hasattr(self, "smoothCheckBox"):
             self.smoothCheckBox.toggled.connect(self.on_smoothing_toggled)
+        if hasattr(self, "traceAverageComboBox"):
+            self.traceAverageComboBox.currentIndexChanged.connect(self.on_trace_average_changed)
         if hasattr(self, "persistenceCheckBox"):
             self.persistenceCheckBox.toggled.connect(self.on_persistence_toggled)
         if hasattr(self, "baselineCheckBox"):
@@ -272,14 +357,32 @@ class SDRGUI(QtWidgets.QMainWindow):
 
     def update_ifgain(self):
         """Forward the IF gain slider value to the SDR controller."""
+        if self.autoGainCheckBox.isChecked():
+            return
         self.controller.update_if_gain(self.IFGRHorizontalSlider.value())
+        self._update_gain_labels()
 
     def update_rfgain(self):
         """Forward the RF gain slider value to the SDR controller."""
-        self.controller.update_rf_gain(self.RFGRHorizontalSlider.value())
+        if self.autoGainCheckBox.isChecked():
+            return
+        value = clamp_lna_state(self._current_center_frequency_hz, self.RFGRHorizontalSlider.value())
+        if value != self.RFGRHorizontalSlider.value():
+            self._set_slider_value(self.RFGRHorizontalSlider, value)
+        self.controller.update_rf_gain(value)
+        self._update_gain_labels()
 
     def set_agc(self):
         """Toggle AGC and keep the IF gain slider in a coherent state."""
+        if self.autoGainCheckBox.isChecked():
+            try:
+                self.AGCCheckBox.blockSignals(True)
+                self.AGCCheckBox.setChecked(False)
+            finally:
+                self.AGCCheckBox.blockSignals(False)
+            self.controller.update_agc(False)
+            self.IFGRHorizontalSlider.setEnabled(False)
+            return
         agc = self.AGCCheckBox.isChecked()
         self.controller.update_agc(agc)
         self.IFGRHorizontalSlider.setEnabled(not agc)
@@ -304,6 +407,92 @@ class SDRGUI(QtWidgets.QMainWindow):
     def set_biastee(self): pass
     def set_fmnotch(self): pass
     def set_dabnotch(self): pass
+
+    def set_auto_gain_mode(self, enabled: bool) -> None:
+        """Switch between the editable auto-gain table and manual gain sliders."""
+        enabled = bool(enabled)
+        if enabled:
+            try:
+                self.AGCCheckBox.blockSignals(True)
+                self.AGCCheckBox.setChecked(False)
+            finally:
+                self.AGCCheckBox.blockSignals(False)
+            self.controller.update_agc(False)
+            self.AGCCheckBox.setEnabled(False)
+            self.IFGRHorizontalSlider.setEnabled(False)
+            self.RFGRHorizontalSlider.setEnabled(False)
+            self._apply_auto_gain_profile()
+        else:
+            self.AGCCheckBox.setEnabled(True)
+            self.RFGRHorizontalSlider.setEnabled(True)
+            self.IFGRHorizontalSlider.setEnabled(not self.AGCCheckBox.isChecked())
+            self._update_gain_labels()
+
+    def _on_auto_gain_profile_changed(self, _level_dbm: int) -> None:
+        """Apply the newly selected auto-gain row when auto mode is active."""
+        if self.autoGainCheckBox.isChecked():
+            self._apply_auto_gain_profile()
+
+    def _on_auto_gain_profiles_changed(self, _profiles: object) -> None:
+        """Re-apply the current auto pair after a table edit."""
+        if self.autoGainCheckBox.isChecked():
+            self._apply_auto_gain_profile()
+
+    def _apply_auto_gain_profile(self) -> None:
+        """Apply the auto-gain pair matching the current frequency band."""
+        if self.auto_gain_dock is None:
+            return
+        lna_state, if_gain = self.auto_gain_dock.widget.get_active_pair_for_frequency(
+            self._current_center_frequency_hz
+        )
+        self._apply_gain_pair(lna_state=lna_state, if_gain=if_gain)
+
+    def _apply_gain_pair(self, lna_state: int, if_gain: int) -> None:
+        """Apply a complete gain pair and mirror it into the UI."""
+        rf_value = clamp_lna_state(self._current_center_frequency_hz, lna_state)
+        if_value = int(max(self.IFGRHorizontalSlider.minimum(), min(int(if_gain), self.IFGRHorizontalSlider.maximum())))
+        self.controller.update_rf_gain(rf_value)
+        self.controller.update_if_gain(if_value)
+        self._set_slider_value(self.RFGRHorizontalSlider, rf_value)
+        self._set_slider_value(self.IFGRHorizontalSlider, if_value)
+        self._update_gain_labels()
+
+    def _update_rf_slider_range(self) -> None:
+        """Clamp the RF/LNA slider to the valid state range for the current band."""
+        max_state = int(max_lna_state_for_frequency(self._current_center_frequency_hz))
+        self.RFGRHorizontalSlider.setMinimum(0)
+        self.RFGRHorizontalSlider.setMaximum(max_state)
+        clamped_value = clamp_lna_state(self._current_center_frequency_hz, self.controller.rf_gain)
+        if int(self.controller.rf_gain) != clamped_value:
+            self.controller.update_rf_gain(clamped_value)
+        self._set_slider_value(self.RFGRHorizontalSlider, clamped_value)
+
+    def _update_gain_labels(self) -> None:
+        """Refresh the visible LNA and IF attenuation labels."""
+        lna_state = clamp_lna_state(self._current_center_frequency_hz, self.controller.rf_gain)
+        lna_attn_db = lna_attenuation_db(self._current_center_frequency_hz, lna_state)
+        if_attn_db = int(self.controller.if_gain)
+        self.lnaAttenuationValueLabel.setText(f"LNA attn: {lna_attn_db} dB (state {lna_state})")
+        self.ifAttenuationValueLabel.setText(f"IF attn: {if_attn_db} dB")
+
+    @staticmethod
+    def _set_slider_value(slider: QtWidgets.QSlider, value: int) -> None:
+        """Update a slider without triggering its change handlers."""
+        try:
+            slider.blockSignals(True)
+            slider.setValue(int(value))
+        finally:
+            slider.blockSignals(False)
+
+    def show_auto_gain_dock(self) -> None:
+        """Present the auto-gain dock as a floating tool window."""
+        if self.auto_gain_dock is None:
+            return
+        self.auto_gain_dock.setFloating(True)
+        self.auto_gain_dock.resize(QtCore.QSize(900, 420))
+        self.auto_gain_dock.show()
+        self.auto_gain_dock.raise_()
+        self.auto_gain_dock.activateWindow()
 
     def shutdown(self):
         """Stop acquisition, close receiver workers, and stop tracked background threads."""
@@ -337,6 +526,35 @@ class SDRGUI(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(bool)
     def on_smoothing_toggled(self, checked: bool):
         self.display_controller.on_smoothing_toggled(checked)
+
+    @QtCore.pyqtSlot(int)
+    def on_trace_average_changed(self, _index: int):
+        if not hasattr(self, "traceAverageComboBox"):
+            return
+        alpha = self.traceAverageComboBox.currentData()
+        if alpha is None:
+            return
+        self.controller.set_spectrum_trace_alpha(float(alpha))
+
+    def _set_trace_average_preset(self, alpha: float) -> None:
+        if not hasattr(self, "traceAverageComboBox"):
+            return
+        target = float(alpha)
+        best_index = 0
+        best_error = None
+        self.traceAverageComboBox.blockSignals(True)
+        try:
+            for index in range(self.traceAverageComboBox.count()):
+                value = self.traceAverageComboBox.itemData(index)
+                if value is None:
+                    continue
+                error = abs(float(value) - target)
+                if best_error is None or error < best_error:
+                    best_error = error
+                    best_index = index
+            self.traceAverageComboBox.setCurrentIndex(best_index)
+        finally:
+            self.traceAverageComboBox.blockSignals(False)
 
     @QtCore.pyqtSlot(bool)
     def on_persistence_toggled(self, checked: bool):

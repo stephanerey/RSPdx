@@ -16,6 +16,7 @@ from src.config.settings import (
     DEFAULT_PERF_LOG_INTERVAL_S,
     DEFAULT_RF_GAIN,
     DEFAULT_SAMPLE_RATE,
+    DEFAULT_SPECTRUM_TRACE_ALPHA,
     MAX_HISTORY_SIZE,
 )
 from src.core.data_storage import DataStorage
@@ -52,7 +53,7 @@ class SDRController(QObject):
         self._last_plot_push = 0.0
         self._plot_interval_s = 1.0 / float(DEFAULT_FFT_FPS)
         self._fft_db_ema = None
-        self._fft_ema_alpha = 1.0
+        self._fft_ema_alpha = float(DEFAULT_SPECTRUM_TRACE_ALPHA)
         self._fft_win = None
         self._fft_win_size = 0
         self._fft_win_power = 1.0
@@ -518,3 +519,13 @@ class SDRController(QObject):
         p_db = compute_power_spectrum_db(iq_data, nfft, window=self._fft_win, window_power=self._fft_win_power)
         self._fft_db_ema = apply_ema(p_db, self._fft_db_ema, alpha=self._fft_ema_alpha)
         return self._fft_db_ema.astype(np.float32, copy=False)
+
+    @property
+    def spectrum_trace_alpha(self) -> float:
+        return float(self._fft_ema_alpha)
+
+    def set_spectrum_trace_alpha(self, alpha: float) -> None:
+        clipped = float(np.clip(float(alpha), 0.01, 1.0))
+        if abs(clipped - float(self._fft_ema_alpha)) < 1e-9:
+            return
+        self._fft_ema_alpha = clipped

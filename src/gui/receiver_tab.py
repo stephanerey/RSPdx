@@ -1,7 +1,78 @@
 # src/gui/receiver_tab.py
-from PyQt5 import QtWidgets, QtCore
-from src.core.demodulators import FMDemodulator
+import collections
+import time
+from typing import Optional
+
+import numpy as np
 import sounddevice as sd
+from PyQt5 import QtWidgets, QtCore
+
+from src.core.demodulators import FMDemodulator
+
+
+def measure_band_noise(freq_hz, power_db, center_hz: float, bandwidth_hz: float):
+    """Measure integrated and per-bin noise inside the requested receiver bandwidth."""
+    if freq_hz is None or power_db is None:
+        return None
+
+    x = np.asarray(freq_hz, dtype=np.float64)
+    y_db = np.asarray(power_db, dtype=np.float32)
+    if x.size == 0 or y_db.size == 0 or x.size != y_db.size:
+        return None
+
+    finite = np.isfinite(x) & np.isfinite(y_db)
+    if not np.any(finite):
+        return None
+
+    x = x[finite]
+    y_db = y_db[finite]
+    half_bw_hz = max(0.5, float(bandwidth_hz) * 0.5)
+    mask = np.abs(x - float(center_hz)) <= half_bw_hz
+    if not np.any(mask):
+        nearest = int(np.argmin(np.abs(x - float(center_hz))))
+        mask = np.zeros(x.size, dtype=bool)
+        mask[nearest] = True
+
+    band_power_linear = np.power(10.0, y_db[mask].astype(np.float64) / 10.0)
+    integrated_linear = float(np.sum(band_power_linear, dtype=np.float64))
+    if not np.isfinite(integrated_linear) or integrated_linear <= 0.0:
+        return None
+    bins_count = int(np.count_nonzero(mask))
+    mean_bin_linear = float(integrated_linear / max(1, bins_count))
+    if not np.isfinite(mean_bin_linear) or mean_bin_linear <= 0.0:
+        return None
+    return {
+        "integrated_linear": integrated_linear,
+        "integrated_db": float(10.0 * np.log10(integrated_linear)),
+        "mean_bin_linear": mean_bin_linear,
+        "mean_bin_db": float(10.0 * np.log10(mean_bin_linear)),
+        "bins_count": bins_count,
+    }
+
+
+def integrate_band_noise_power(freq_hz, power_db, center_hz: float, bandwidth_hz: float):
+    """Backward-compatible wrapper returning only the integrated band power."""
+    result = measure_band_noise(freq_hz, power_db, center_hz, bandwidth_hz)
+    if result is None:
+        return None
+    return result["integrated_linear"], result["integrated_db"]
+
+
+def average_recent_noise_samples(samples, window_s: float, now_s: Optional[float] = None):
+    """Average integrated noise power over the requested time window."""
+    if not samples:
+        return None
+
+    now_s = time.monotonic() if now_s is None else float(now_s)
+    cutoff_s = now_s - max(0.0, float(window_s))
+    values = [
+        float(power_linear)
+        for ts, power_linear in samples
+        if float(ts) >= cutoff_s and np.isfinite(power_linear) and float(power_linear) > 0.0
+    ]
+    if not values:
+        return None
+    return float(np.mean(np.asarray(values, dtype=np.float64)))
 
 class ReceiverTab(QtWidgets.QWidget):
     """
@@ -38,6 +109,29 @@ class ReceiverTab(QtWidgets.QWidget):
         self.bwSpin.setSuffix(" kHz")
         self.bwSpin.setSingleStep(0.1)
 
+        self.noiseValueLabel = QtWidgets.QLabel("--.-- dB")
+        self.noiseValueLabel.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.noiseSpectrumLabel = QtWidgets.QLabel("--.-- dB/bin")
+        self.noiseSpectrumLabel.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.noiseSpectrumLabel.setStyleSheet("color: #b0b0b0;")
+        self.noiseModeLabel = QtWidgets.QLabel("Absolute")
+        self.noiseModeLabel.setStyleSheet("color: #cccccc;")
+        self.noiseReferenceButton = QtWidgets.QPushButton("Show relative")
+        noiseWidget = QtWidgets.QWidget(self)
+        noiseLayout = QtWidgets.QHBoxLayout(noiseWidget)
+        noiseLayout.setContentsMargins(0, 0, 0, 0)
+        noiseLayout.addWidget(self.noiseValueLabel, 0)
+        noiseLayout.addWidget(self.noiseModeLabel, 0)
+        noiseLayout.addStretch(1)
+        noiseLayout.addWidget(self.noiseReferenceButton, 0)
+
+        self.noiseAverageSpin = QtWidgets.QDoubleSpinBox()
+        self.noiseAverageSpin.setDecimals(1)
+        self.noiseAverageSpin.setRange(0.1, 60.0)
+        self.noiseAverageSpin.setSingleStep(0.1)
+        self.noiseAverageSpin.setSuffix(" s")
+        self.noiseAverageSpin.setValue(0.5)
+
         self.costasEnable = QtWidgets.QCheckBox("Enable Costas loop")
         self.costasMode = QtWidgets.QComboBox(); self.costasMode.addItems(["qpsk", "bpsk"])
         self.iqCorrEnable = QtWidgets.QCheckBox("IQ correction")
@@ -63,6 +157,9 @@ class ReceiverTab(QtWidgets.QWidget):
 
         form.addRow("Selected frequency:", self.freqSpin)
         form.addRow("Bandwidth:", self.bwSpin)
+        form.addRow("Noise power:", noiseWidget)
+        form.addRow("Spectrum eq.:", self.noiseSpectrumLabel)
+        form.addRow("Noise avg:", self.noiseAverageSpin)
         form.addRow(self.costasEnable)
         form.addRow("Costas mode:", self.costasMode)
         form.addRow(self.iqCorrEnable)
@@ -100,7 +197,12 @@ class ReceiverTab(QtWidgets.QWidget):
         # état
         self._rx = None
         self._spec = None
+        self._data_storage = None
         self._guard = False
+        self._latest_noise_linear = None
+        self._noise_reference_linear = None
+        self._noise_relative_enabled = False
+        self._noise_history = collections.deque()
 
         # signals RF
         self.freqSpin.valueChanged.connect(self._on_ui_freq_changed)
@@ -118,6 +220,8 @@ class ReceiverTab(QtWidgets.QWidget):
         self.audioDevice.currentIndexChanged.connect(self._on_device_changed)
         self.refreshBtn.clicked.connect(self._populate_devices)
         self.demodButtonGroup.buttonToggled.connect(self._on_demod_button_toggled)
+        self.noiseReferenceButton.clicked.connect(self._toggle_noise_mode)
+        self.noiseAverageSpin.valueChanged.connect(self._on_noise_average_changed)
 
     def _populate_devices(self):
         self.audioDevice.blockSignals(True)
@@ -145,9 +249,10 @@ class ReceiverTab(QtWidgets.QWidget):
             self.audioDevice.blockSignals(False)
 
     # — binding —
-    def bind(self, rx, spectrum_widget):
+    def bind(self, rx, spectrum_widget, data_storage=None):
         self._rx = rx
         self._spec = spectrum_widget
+        self._data_storage = data_storage
         rx.demod_mode = getattr(rx, "demod_mode", "fm")
 
         self._populate_devices()
@@ -198,18 +303,127 @@ class ReceiverTab(QtWidgets.QWidget):
 
         spectrum_widget.receiver_frequency_changed.connect(self._on_spec_freq_changed)
         spectrum_widget.receiver_bandwidth_changed.connect(self._on_spec_bw_changed)
+        if data_storage is not None:
+            data_storage.data_updated.connect(self._on_spectrum_data_updated)
+            data_storage.data_recalculated.connect(self._on_spectrum_data_updated)
         self.request_set_audio_device.emit(self._current_device_index())
+        self._refresh_noise_measurement()
 
     # — UI → RX —
     def _on_ui_freq_changed(self, mhz: float):
         if self._guard or self._rx is None:
             return
         self.request_set_frequency.emit(mhz * 1e6)
+        self._reset_noise_history()
+        self._refresh_noise_measurement()
 
     def _on_ui_bw_changed(self, khz: float):
         if self._guard or self._rx is None:
             return
         self.request_set_bandwidth.emit(khz * 1e3)
+        self._reset_noise_history()
+        self._refresh_noise_measurement()
+
+    def _noise_average_window_s(self) -> float:
+        return float(self.noiseAverageSpin.value())
+
+    def _reset_noise_history(self):
+        self._noise_history.clear()
+        self._latest_noise_linear = None
+
+    def _update_noise_mode_ui(self):
+        if self._noise_relative_enabled and self._noise_reference_linear is not None and self._noise_reference_linear > 0.0:
+            self.noiseModeLabel.setText("Relative")
+            self.noiseReferenceButton.setText("Show absolute")
+        else:
+            self.noiseModeLabel.setText("Absolute")
+            self.noiseReferenceButton.setText("Show relative")
+
+    def _append_noise_sample(self, power_linear: float):
+        now_s = time.monotonic()
+        self._noise_history.append((now_s, float(power_linear)))
+        cutoff_s = now_s - max(0.0, self._noise_average_window_s()) - 0.25
+        while self._noise_history and float(self._noise_history[0][0]) < cutoff_s:
+            self._noise_history.popleft()
+
+    def _set_noise_label(self, value_db):
+        if value_db is None or not np.isfinite(value_db):
+            self.noiseValueLabel.setText("--.-- dB")
+            return
+        if abs(float(value_db)) < 0.005:
+            value_db = 0.0
+        self.noiseValueLabel.setText(f"{float(value_db):.2f} dB")
+
+    def _set_noise_spectrum_label(self, value_db):
+        if value_db is None or not np.isfinite(value_db):
+            self.noiseSpectrumLabel.setText("--.-- dB/bin")
+            return
+        if abs(float(value_db)) < 0.005:
+            value_db = 0.0
+        self.noiseSpectrumLabel.setText(f"{float(value_db):.2f} dB/bin")
+
+    def _refresh_noise_measurement(self):
+        if self._rx is None or self._data_storage is None:
+            self._latest_noise_linear = None
+            self._update_noise_mode_ui()
+            self._set_noise_label(None)
+            self._set_noise_spectrum_label(None)
+            return
+
+        result = measure_band_noise(
+            getattr(self._data_storage, "x", None),
+            getattr(self._data_storage, "y", None),
+            float(self.freqSpin.value()) * 1e6,
+            float(self.bwSpin.value()) * 1e3,
+        )
+        if result is None:
+            self._latest_noise_linear = None
+            self._update_noise_mode_ui()
+            self._set_noise_label(None)
+            self._set_noise_spectrum_label(None)
+            return
+
+        integrated_linear = float(result["integrated_linear"])
+        self._append_noise_sample(integrated_linear)
+        averaged_linear = average_recent_noise_samples(
+            self._noise_history,
+            self._noise_average_window_s(),
+        )
+        if averaged_linear is None:
+            self._latest_noise_linear = None
+            self._update_noise_mode_ui()
+            self._set_noise_label(None)
+            self._set_noise_spectrum_label(None)
+            return
+        self._latest_noise_linear = averaged_linear
+        averaged_db = float(10.0 * np.log10(averaged_linear))
+        spectrum_equivalent_db = float(result["mean_bin_db"])
+        if (
+            self._noise_relative_enabled
+            and self._noise_reference_linear is not None
+            and self._noise_reference_linear > 0.0
+        ):
+            display_db = 10.0 * np.log10(averaged_linear / self._noise_reference_linear)
+        else:
+            display_db = averaged_db
+        self._update_noise_mode_ui()
+        self._set_noise_label(display_db)
+        self._set_noise_spectrum_label(spectrum_equivalent_db)
+
+    def _toggle_noise_mode(self):
+        self._refresh_noise_measurement()
+        if self._noise_relative_enabled:
+            self._noise_relative_enabled = False
+        else:
+            if self._latest_noise_linear is None or self._latest_noise_linear <= 0.0:
+                return
+            self._noise_reference_linear = float(self._latest_noise_linear)
+            self._noise_relative_enabled = True
+        self._refresh_noise_measurement()
+
+    def _on_noise_average_changed(self, _seconds: float):
+        self._reset_noise_history()
+        self._refresh_noise_measurement()
 
     def _set_demod_button(self, demod_mode: str):
         button = self.demodButtons.get(str(demod_mode).lower())
@@ -356,6 +570,8 @@ class ReceiverTab(QtWidgets.QWidget):
             self.freqSpin.setValue(f_hz / 1e6)
         finally:
             self._guard = False
+        self._reset_noise_history()
+        self._refresh_noise_measurement()
 
     def _on_rx_bw_changed(self, bw_hz: float):
         self._guard = True
@@ -363,6 +579,8 @@ class ReceiverTab(QtWidgets.QWidget):
             self.bwSpin.setValue(bw_hz / 1e3)
         finally:
             self._guard = False
+        self._reset_noise_history()
+        self._refresh_noise_measurement()
 
     @QtCore.pyqtSlot(str)
     def _on_rx_demod_changed(self, demod_mode: str):
@@ -393,6 +611,8 @@ class ReceiverTab(QtWidgets.QWidget):
         finally:
             self.freqSpin.blockSignals(False)
             self._guard = False
+        self._reset_noise_history()
+        self._refresh_noise_measurement()
 
     def _on_spec_bw_changed(self, bw_hz: float):
         self._guard = True
@@ -402,6 +622,12 @@ class ReceiverTab(QtWidgets.QWidget):
         finally:
             self.bwSpin.blockSignals(False)
             self._guard = False
+        self._reset_noise_history()
+        self._refresh_noise_measurement()
+
+    @QtCore.pyqtSlot(object)
+    def _on_spectrum_data_updated(self, _data_storage):
+        self._refresh_noise_measurement()
 
 
 class ReceiverTabPage(QtWidgets.QWidget):
@@ -412,5 +638,5 @@ class ReceiverTabPage(QtWidgets.QWidget):
         lay.setContentsMargins(6, 6, 6, 6)
         lay.addWidget(self.rx_panel)
 
-    def bind(self, rx, spec_widget):
-        self.rx_panel.bind(rx, spec_widget)
+    def bind(self, rx, spec_widget, data_storage=None):
+        self.rx_panel.bind(rx, spec_widget, data_storage=data_storage)

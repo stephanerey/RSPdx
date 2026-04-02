@@ -27,7 +27,7 @@ class ReceiversUI(QtCore.QObject):
     # — public API —
     def add_tab_for_rx(self, rx, make_current=True):
         page = ReceiverTabPage(self.w)
-        page.bind(rx, self.w.spectrumPlotWidget)
+        page.bind(rx, self.w.spectrumPlotWidget, getattr(self.w.controller, "data_storage", None))
 
         plus_idx = self._plus_tab_index()
         if plus_idx is None:

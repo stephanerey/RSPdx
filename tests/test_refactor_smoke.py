@@ -11,10 +11,17 @@ from src.core.demodulators.cw import demodulate_cw
 from src.core.demodulators.registry import build_demodulator_registry
 from src.core.demodulators.ssb import demodulate_ssb
 from src.core.dsp import compute_power_spectrum_db, select_fft_size
+from src.gui.gain_table_ui import AutoGainTableWidget
 from src.gui.log_viewer_ui import LogViewerWidget
-from src.gui.receiver_tab import ReceiverTab
+from src.gui.receiver_tab import (
+    ReceiverTab,
+    average_recent_noise_samples,
+    integrate_band_noise_power,
+    measure_band_noise,
+)
 from src.gui.threads_ui import ThreadsWidget
 from src.threading_utils.thread_manager import ManagedTaskStatus, ThreadManager
+from src.tools.gain_table import build_default_auto_gain_profiles, lna_attenuation_db
 from src.tools.paths import ensure_runtime_directories, get_log_file_path
 
 
@@ -129,7 +136,89 @@ class RefactorSmokeTests(unittest.TestCase):
         widget = ReceiverTab()
         self.assertEqual(sorted(widget.demodButtons.keys()), ["am", "cw", "fm", "lsb", "usb"])
         self.assertFalse(widget.audioEnable.isChecked())
+        self.assertEqual(widget.noiseValueLabel.text(), "--.-- dB")
+        self.assertEqual(widget.noiseSpectrumLabel.text(), "--.-- dB/bin")
+        self.assertEqual(widget.noiseReferenceButton.text(), "Show relative")
+        self.assertAlmostEqual(widget.noiseAverageSpin.value(), 0.5, places=6)
+        self.assertAlmostEqual(widget.noiseAverageSpin.singleStep(), 0.1, places=6)
         widget.deleteLater()
+
+    def test_noise_button_toggles_between_absolute_and_relative(self):
+        widget = ReceiverTab()
+        widget._latest_noise_linear = 4.0
+        widget._refresh_noise_measurement = widget._update_noise_mode_ui
+
+        widget._toggle_noise_mode()
+        self.assertTrue(widget._noise_relative_enabled)
+        self.assertAlmostEqual(widget._noise_reference_linear, 4.0, places=9)
+        self.assertEqual(widget.noiseModeLabel.text(), "Relative")
+        self.assertEqual(widget.noiseReferenceButton.text(), "Show absolute")
+
+        widget._toggle_noise_mode()
+        self.assertFalse(widget._noise_relative_enabled)
+        self.assertEqual(widget.noiseModeLabel.text(), "Absolute")
+        self.assertEqual(widget.noiseReferenceButton.text(), "Show relative")
+        widget.deleteLater()
+
+    def test_integrate_band_noise_power_sums_only_bins_inside_band(self):
+        freqs = np.array([99.0, 99.5, 100.0, 100.5, 101.0], dtype=np.float64) * 1e6
+        power_db = np.array([-30.0, -20.0, -10.0, -20.0, -30.0], dtype=np.float32)
+
+        result = integrate_band_noise_power(freqs, power_db, 100.0e6, 1.0e6)
+
+        self.assertIsNotNone(result)
+        integrated_linear, integrated_db = result
+        expected_linear = (10.0 ** (-20.0 / 10.0)) + (10.0 ** (-10.0 / 10.0)) + (10.0 ** (-20.0 / 10.0))
+        self.assertAlmostEqual(integrated_linear, expected_linear, places=9)
+        self.assertAlmostEqual(integrated_db, 10.0 * np.log10(expected_linear), places=6)
+
+    def test_measure_band_noise_reports_integrated_and_per_bin_levels(self):
+        freqs = np.array([99.0, 99.5, 100.0, 100.5, 101.0], dtype=np.float64) * 1e6
+        power_db = np.array([-30.0, -20.0, -10.0, -20.0, -30.0], dtype=np.float32)
+
+        result = measure_band_noise(freqs, power_db, 100.0e6, 1.0e6)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        expected_linear = (10.0 ** (-20.0 / 10.0)) + (10.0 ** (-10.0 / 10.0)) + (10.0 ** (-20.0 / 10.0))
+        expected_mean_bin = expected_linear / 3.0
+        self.assertEqual(result["bins_count"], 3)
+        self.assertAlmostEqual(result["integrated_linear"], expected_linear, places=9)
+        self.assertAlmostEqual(result["integrated_db"], 10.0 * np.log10(expected_linear), places=6)
+        self.assertAlmostEqual(result["mean_bin_linear"], expected_mean_bin, places=9)
+        self.assertAlmostEqual(result["mean_bin_db"], 10.0 * np.log10(expected_mean_bin), places=6)
+
+    def test_average_recent_noise_samples_applies_time_window(self):
+        samples = [
+            (1.00, 1.0),
+            (1.20, 3.0),
+            (1.55, 5.0),
+            (1.80, 7.0),
+        ]
+
+        average = average_recent_noise_samples(samples, 0.5, now_s=1.80)
+
+        self.assertAlmostEqual(average, (5.0 + 7.0) / 2.0, places=9)
+
+    def test_auto_gain_table_widget_exposes_band_pair(self):
+        widget = AutoGainTableWidget()
+        widget.set_current_frequency(414_500_000.0)
+        lna_state, if_gain = widget.get_active_pair_for_frequency(414_500_000.0)
+        self.assertGreaterEqual(lna_state, 0)
+        self.assertGreaterEqual(if_gain, 20)
+        self.assertEqual(widget.selected_level_dbm, -60)
+        self.assertGreaterEqual(lna_attenuation_db(414_500_000.0, lna_state), 0)
+        widget.deleteLater()
+
+    def test_default_auto_gain_profiles_match_reference_table(self):
+        profiles = build_default_auto_gain_profiles()
+        self.assertEqual(profiles[-100][0], (0, 40))
+        self.assertEqual(profiles[-70][4], (0, 59))
+        self.assertEqual(profiles[-70][6], (1, 50))
+        self.assertEqual(profiles[-60][9], (3, 59))
+        self.assertEqual(profiles[-20][10], (12, 59))
+        self.assertEqual(profiles[0][4], (22, 59))
+        self.assertEqual(profiles[20][10], (18, 59))
 
 
 if __name__ == "__main__":
